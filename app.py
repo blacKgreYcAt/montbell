@@ -13,7 +13,7 @@ from openpyxl.styles import PatternFill, Font, Alignment
 # 0. 頁面全域設定
 # ==========================================
 st.set_page_config(
-    page_title="Montbell 自動化中心 v3.0",
+    page_title="Montbell 自動化中心 v3.1",
     page_icon="🏔️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -55,6 +55,9 @@ def get_gemini_response(prompt, api_key, model_name):
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
+        # 如果遇到 404 錯誤，嘗試給出更友善的提示
+        if "404" in str(e):
+            return f"Error: 模型名稱錯誤或不支援 ({model_name})。建議切換至 gemini-1.5-flash。"
         return f"Error: {str(e)}"
 
 def scrape_montbell_single(model):
@@ -137,7 +140,7 @@ def create_spec_prompt(text):
 # ==========================================
 with st.sidebar:
     st.title("🛠️ 設定中心")
-    st.info("👋 Hi Benjamin, v3.0 Ready!")
+    st.info("👋 Hi Benjamin, v3.1 Fix")
     
     st.markdown("### 1. API 金鑰")
     api_key = st.text_input("Google Gemini API Key", type="password", placeholder="貼上 Key...")
@@ -150,15 +153,17 @@ with st.sidebar:
     if test_btn and api_key:
         try:
             genai.configure(api_key=api_key)
-            m = genai.GenerativeModel("gemini-pro")
-            m.generate_content("Test")
+            # [FIX] 這裡強制使用最穩定的 Flash 模型進行測試，避免 gemini-pro 404 錯誤
+            m = genai.GenerativeModel("gemini-1.5-flash")
+            response = m.generate_content("Test connection")
             st.sidebar.success("✅ API 連線成功！")
         except Exception as e:
             st.sidebar.error(f"❌ 連線失敗: {e}")
 
     st.markdown("### 2. 模型選擇")
-    model_options = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
-    selected_model = st.selectbox("AI 模型", model_options, index=0, help="Flash最快，Pro品質較好")
+    # [FIX] 移除了舊版 gemini-pro，改用明確版本號
+    model_options = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"]
+    selected_model = st.selectbox("AI 模型", model_options, index=0, help="Flash最快(推薦)，Pro品質較好")
     
     st.markdown("---")
     st.caption("Design for Montbell Workflow")
@@ -166,12 +171,12 @@ with st.sidebar:
 # ==========================================
 # 3. 主畫面
 # ==========================================
-st.title("🏔️ Montbell 自動化中心 v3.0")
+st.title("🏔️ Montbell 自動化中心 v3.1")
 
 tabs = st.tabs(["⚡ 一鍵全自動 (All-in-One)", "📥 分步：爬蟲", "🈺 分步：翻譯", "✨ 分步：優化"])
 
 # ==========================================
-# TAB 1: 一鍵全自動 (New!)
+# TAB 1: 一鍵全自動 (All-in-One)
 # ==========================================
 with tabs[0]:
     st.header("⚡ 一鍵全自動處理流程")
@@ -184,7 +189,7 @@ with tabs[0]:
         with st.expander("參數設定 (點擊展開)", expanded=True):
             sheet_name_all = st.text_input("工作表名稱", value="工作表1", key="sn_all")
             model_col_idx_all = st.number_input("型號欄位索引 (A=0, B=1...)", value=0, min_value=0, key="mi_all")
-            char_limit_all = st.number_input("描述精簡字數限制", value=50, min_value=10, key="cl_all") # 最低 10 字
+            char_limit_all = st.number_input("描述精簡字數限制", value=50, min_value=10, key="cl_all")
             
     if st.button("🚀 啟動全自動排程", type="primary", key="btn_all"):
         if not uploaded_file_all or not api_key:
@@ -252,7 +257,7 @@ with tabs[0]:
                 st.error(f"執行錯誤: {e}")
 
 # ==========================================
-# TAB 2: 爬蟲 (Scraper) - 保留原功能
+# TAB 2: 爬蟲 (Scraper)
 # ==========================================
 with tabs[1]:
     st.header("📥 步驟一：官網爬蟲 (僅下載)")
@@ -264,7 +269,6 @@ with tabs[1]:
         start_row = st.number_input("開始列", value=2, key="sr_1")
     
     if st.button("開始爬取", key="btn_1") and uploaded_file:
-        # 簡化的調用邏輯，為節省篇幅，此處邏輯與 Tab 1 類似，但只做爬蟲
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
         models = []
         for idx, row in df.iterrows():
@@ -287,7 +291,7 @@ with tabs[1]:
         st.download_button("下載 Excel", out.getvalue(), "scraped.xlsx")
 
 # ==========================================
-# TAB 3: 翻譯 (Translator) - 保留原功能
+# TAB 3: 翻譯 (Translator)
 # ==========================================
 with tabs[2]:
     st.header("🈺 步驟二：AI 翻譯 (僅翻譯)")
@@ -313,7 +317,7 @@ with tabs[2]:
             st.download_button("下載翻譯檔", out.getvalue(), "translated.xlsx")
 
 # ==========================================
-# TAB 4: 優化 (Refiner) - 更新 Slider
+# TAB 4: 優化 (Refiner)
 # ==========================================
 with tabs[3]:
     st.header("✨ 步驟三：優化精簡 (僅優化)")
@@ -322,7 +326,6 @@ with tabs[3]:
         df_r = pd.read_excel(up_ref)
         c_desc = st.selectbox("描述欄位", df_r.columns)
         c_spec = st.selectbox("規格欄位", ["(不處理)"] + list(df_r.columns))
-        # 更新：最低門檻改為 10
         limit = st.slider("字數限制", 10, 200, 50)
         
         if st.button("開始優化", key="btn_3"):
