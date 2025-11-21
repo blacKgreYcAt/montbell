@@ -7,8 +7,6 @@ from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import time
 import re
 import io
-import os
-from datetime import datetime
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 
@@ -16,7 +14,7 @@ from openpyxl.styles import PatternFill, Font, Alignment
 # 0. 頁面全域設定
 # ==========================================
 st.set_page_config(
-    page_title="Montbell 自動化中心 v3.6.2 (修復版)",
+    page_title="Montbell 自動化中心 v3.8 (精準版)",
     page_icon="🏔️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -77,10 +75,14 @@ def get_available_models(api_key):
     except: return []
 
 def scrape_montbell_single(model):
+    """爬蟲：只抓取 標題(為了辨識)、描述、規格"""
     headers = {'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'ja-JP'}
     base_url = "https://webshop.montbell.jp/"
     search_url = "https://webshop.montbell.jp/goods/list_search.php?top_sk="
-    info = {'型號': model, '商品名': '', '價格': '', '商品描述': '', '規格': '', '機能': '', '商品URL': ''}
+    
+    # [v3.8] 欄位簡化，只保留指定項目
+    info = {'型號': model, '商品名': '', '商品描述': '', '規格': '', '商品URL': ''}
+    
     try:
         target_url = f"{base_url}goods/disp.php?product_id={model}"
         resp = requests.get(target_url, headers=headers, timeout=10)
@@ -92,19 +94,24 @@ def scrape_montbell_single(model):
                 if link:
                     target_url = base_url + link['href'].lstrip('/')
                     resp = requests.get(target_url, headers=headers, timeout=10)
+        
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, 'html.parser')
             info['商品URL'] = target_url
-            name = soup.select_one('h1.goods-detail__ttl-main, h1')
+            
+            name = soup.select_one('h1.goods-detail__ttl-main, h1.product-title, h1')
             if name: info['商品名'] = name.text.strip()
-            price = soup.select_one('.goods-detail__price, span.selling_price')
-            if price: info['價格'] = price.text.strip()
+            else:
+                if soup.title: info['商品名'] = soup.title.text.split('|')[0].strip()
+
+            # [v3.8] 移除價格與機能抓取，專注描述與規格
             desc = soup.select('.column1.type01 .innerCont p')
             if desc: info['商品描述'] = desc[0].text.strip()
+            
             spec = soup.select('.column1.type01, div.explanationBox')
             for s in spec:
                 if '仕様' in s.text: info['規格'] = s.text.strip()
-                if '機能' in s.text: info['機能'] = s.text.strip()
+            
             if not info['規格']:
                 sf = soup.select_one('div.explanationBox')
                 if sf: info['規格'] = sf.text.strip()
@@ -144,9 +151,9 @@ with st.sidebar:
         except Exception as e: st.error(f"❌ 失敗: {e}")
         
     st.markdown("---")
-    st.info("ℹ️ **v3.6.2 修復版**")
+    st.info("ℹ️ **v3.8 精準版**：\n只抓取並處理「描述」與「規格」，產出包含 原文/翻譯/AI精簡 的完整報表。")
 
-st.title("🏔️ Montbell 自動化中心 v3.6")
+st.title("🏔️ Montbell 自動化中心 v3.8")
 
 nav1, nav2, nav3, nav4 = st.columns(4)
 with nav1:
@@ -164,7 +171,7 @@ st.markdown("---")
 # ==========================================
 
 if st.session_state.current_page == 'all_in_one':
-    st.markdown("### ⚡ 一鍵全自動處理 (含斷線保護)")
+    st.markdown("### ⚡ 一鍵全自動處理 (描述 & 規格專用)")
     
     c_in, c_set = st.columns([1, 1])
     with c_in: uploaded_file = st.file_uploader("上傳 Excel", type=["xlsx", "xls"], key="up_all")
@@ -172,10 +179,7 @@ if st.session_state.current_page == 'all_in_one':
         with st.expander("⚙️ 設定", expanded=True):
             sheet_name = st.text_input("工作表", "工作表1", key="sn_all")
             col_idx = st.number_input("型號欄位索引", value=0, min_value=0, key="mi_all")
-            
-            # [FIX] 修正參數順序，並使用具名參數避免錯誤
             limit = st.number_input("精簡字數限制", min_value=10, max_value=500, value=50, step=10, key="cl_all")
-            
             autosave_interval = st.number_input("自動存檔頻率", min_value=1, max_value=100, value=20, key="as_all")
 
     stop_requested = st.checkbox("🛑 緊急停止 (勾選後，處理完當前筆數即停止)", key="stop_chk")
@@ -197,7 +201,6 @@ if st.session_state.current_page == 'all_in_one':
                 else:
                     results = []
                     total = len(models)
-                    
                     status_box = st.status("🚀 任務初始化...", expanded=True)
                     prog_bar = st.progress(0)
                     
@@ -211,23 +214,45 @@ if st.session_state.current_page == 'all_in_one':
                         status_box.update(label=f"⏳ [{i+1}/{total}] 正在處理: {m} ({pct}%)")
                         
                         try:
+                            # 1. 爬蟲 (只抓描述與規格)
                             raw = scrape_montbell_single(m)
-                            trans = raw.copy()
-                            if raw['商品名'] and raw['商品名'] != '未找到':
-                                trans['商品名_TW'] = get_gemini_response(create_trans_prompt(raw['商品名']), api_key, selected_model)
-                                trans['商品描述_TW'] = get_gemini_response(create_trans_prompt(raw['商品描述']), api_key, selected_model)
-                                trans['規格_TW'] = get_gemini_response(create_trans_prompt(raw['規格']), api_key, selected_model)
-                                trans['機能_TW'] = get_gemini_response(create_trans_prompt(raw['機能']), api_key, selected_model)
-                            else: trans['商品名_TW'] = "查無資料"
-
-                            if raw['商品名'] and raw['商品名'] != '未找到':
-                                trans['精簡描述_AI'] = get_gemini_response(create_refine_prompt(trans['商品描述_TW'], limit), api_key, selected_model)
-                                trans['規格_結構化_AI'] = get_gemini_response(create_spec_prompt(trans['規格_TW']), api_key, selected_model)
-                            else:
-                                trans['精簡描述_AI'] = ""
-                                trans['規格_結構化_AI'] = ""
                             
-                            results.append(trans)
+                            # 準備輸出的資料結構
+                            row_data = {
+                                '型號': raw['型號'],
+                                '商品名': raw['商品名'], # 保留但不翻譯
+                                '商品URL': raw['商品URL'],
+                                # 原文
+                                '商品描述_原文': raw['商品描述'],
+                                '規格_原文': raw['規格'],
+                                # 翻譯與優化 (預設空值)
+                                '商品描述_翻譯': '',
+                                '規格_翻譯': '',
+                                '商品描述_AI精簡': '',
+                                '規格_AI精簡': ''
+                            }
+
+                            # 2. 翻譯與優化
+                            # 寬容判斷：只要有描述或規格，就處理
+                            has_data = raw['商品描述'] or raw['規格']
+                            
+                            if has_data:
+                                # 翻譯
+                                if raw['商品描述']:
+                                    trans_desc = get_gemini_response(create_trans_prompt(raw['商品描述']), api_key, selected_model)
+                                    row_data['商品描述_翻譯'] = trans_desc
+                                    # 優化
+                                    row_data['商品描述_AI精簡'] = get_gemini_response(create_refine_prompt(trans_desc, limit), api_key, selected_model)
+                                
+                                if raw['規格']:
+                                    trans_spec = get_gemini_response(create_trans_prompt(raw['規格']), api_key, selected_model)
+                                    row_data['規格_翻譯'] = trans_spec
+                                    # 優化
+                                    row_data['規格_AI精簡'] = get_gemini_response(create_spec_prompt(trans_spec), api_key, selected_model)
+                            else:
+                                row_data['商品名'] = row_data['商品名'] + " (查無資料)"
+
+                            results.append(row_data)
                             
                             if (i + 1) % autosave_interval == 0:
                                 auto_save_to_local(results, "backup_all_in_one.xlsx")
@@ -243,62 +268,59 @@ if st.session_state.current_page == 'all_in_one':
                     
                     status_box.update(label="✅ 任務結束！", state="complete", expanded=False)
                     
+                    # 整理最終 DataFrame 順序
+                    final_cols = ['型號', '商品名', '商品描述_原文', '規格_原文', '商品描述_翻譯', '規格_翻譯', '商品描述_AI精簡', '規格_AI精簡', '商品URL']
                     df_final = pd.DataFrame(results)
+                    # 確保欄位存在 (防止全空時報錯)
+                    for col in final_cols:
+                        if col not in df_final.columns: df_final[col] = ""
+                    df_final = df_final[final_cols]
+
                     st.success(f"共完成 {len(df_final)} 筆資料。")
-                    
                     out = io.BytesIO()
                     with pd.ExcelWriter(out, engine='openpyxl') as w: df_final.to_excel(w, index=False)
-                    st.download_button("📥 下載最終結果", out.getvalue(), "montbell_final.xlsx", "primary")
+                    st.download_button("📥 下載最終報表", out.getvalue(), "montbell_final.xlsx", "primary")
 
             except Exception as e:
-                st.error(f"讀取檔案或執行時發生嚴重錯誤: {e}")
+                st.error(f"執行錯誤: {e}")
 
 # --- 其他頁面 ---
 elif st.session_state.current_page == 'scraper':
-    st.markdown("### 📥 獨立爬蟲 (含備份)")
+    st.markdown("### 📥 獨立爬蟲 (僅描述與規格)")
     up_1 = st.file_uploader("上傳 Excel", key="up_1")
     c1, c2 = st.columns(2)
     with c1: sheet_1 = st.text_input("工作表", "工作表1", key="sn_1")
     with c2: idx_1, row_1 = st.number_input("索引", 0, key="mi_1"), st.number_input("開始列", 2, key="sr_1")
-    stop_1 = st.checkbox("🛑 停止爬蟲", key="stop_1")
+    stop_1 = st.checkbox("🛑 停止", key="stop_1")
 
     if st.button("開始", key="btn_1") and up_1:
         try:
             df = pd.read_excel(up_1, sheet_name=sheet_1)
             models = [str(r.iloc[idx_1]).strip() for i, r in df.iterrows() if i>=row_1-1 and idx_1<len(r) and re.match(r'^\d{7}$', str(r.iloc[idx_1]).strip())]
-            
             res = []
             prog = st.progress(0)
             for i, m in enumerate(models):
-                if stop_1: 
-                    st.warning("已停止"); break
+                if stop_1: st.warning("已停止"); break
                 res.append(scrape_montbell_single(m))
-                
-                if (i+1)%20 == 0: 
-                    auto_save_to_local(res, "backup_scrape.xlsx")
-                    st.toast(f"已備份 {i+1} 筆")
-                    
+                if (i+1)%20 == 0: auto_save_to_local(res, "backup_scrape.xlsx")
                 prog.progress((i+1)/len(models), text=f"進度 {int((i+1)/len(models)*100)}%")
                 time.sleep(0.5)
-                
             out = io.BytesIO()
             with pd.ExcelWriter(out, engine='openpyxl') as w: pd.DataFrame(res).to_excel(w, index=False)
             st.download_button("下載", out.getvalue(), "scraped.xlsx")
         except Exception as e: st.error(f"錯誤: {e}")
 
 elif st.session_state.current_page == 'translator':
-    st.markdown("### 🈺 獨立翻譯 (含備份)")
+    st.markdown("### 🈺 獨立翻譯")
     up_2 = st.file_uploader("上傳 Excel", key="up_2")
     if up_2 and api_key:
         df_t = pd.read_excel(up_2)
         cols = st.multiselect("翻譯欄位", df_t.columns)
-        stop_2 = st.checkbox("🛑 停止翻譯", key="stop_2")
-        
+        stop_2 = st.checkbox("🛑 停止", key="stop_2")
         if st.button("開始", key="btn_2") and cols:
             new_df = df_t.copy()
             prog = st.progress(0)
-            total = len(df_t) * len(cols)
-            curr = 0
+            total, curr = len(df_t) * len(cols), 0
             for col in cols:
                 new_df[f"{col}_TW"] = ""
                 for i, r in new_df.iterrows():
@@ -306,56 +328,41 @@ elif st.session_state.current_page == 'translator':
                     if pd.notna(r[col]):
                         new_df.at[i, f"{col}_TW"] = get_gemini_response(create_trans_prompt(str(r[col])), api_key, selected_model)
                     curr += 1
-                    if curr % 20 == 0:
-                        auto_save_to_local(new_df.to_dict('records'), "backup_trans.xlsx")
-                        st.toast("已自動備份")
+                    if curr % 20 == 0: auto_save_to_local(new_df.to_dict('records'), "backup_trans.xlsx")
                     prog.progress(curr/total, text=f"{int(curr/total*100)}%")
                     time.sleep(0.5)
                 if stop_2: break
-            
-            if stop_2: st.warning("已停止")
             out = io.BytesIO()
             with pd.ExcelWriter(out, engine='openpyxl') as w: new_df.to_excel(w, index=False)
             st.download_button("下載", out.getvalue(), "translated.xlsx")
 
 elif st.session_state.current_page == 'refiner':
-    st.markdown("### ✨ 獨立優化 (含備份)")
+    st.markdown("### ✨ 獨立優化")
     up_3 = st.file_uploader("上傳 Excel", key="up_3")
     if up_3 and api_key:
         df_r = pd.read_excel(up_3)
         c_d = st.selectbox("描述", df_r.columns)
         c_s = st.selectbox("規格", ["(不處理)"] + list(df_r.columns))
         lim = st.slider("字數", 10, 200, 50)
-        stop_3 = st.checkbox("🛑 停止優化", key="stop_3")
-        
+        stop_3 = st.checkbox("🛑 停止", key="stop_3")
         if st.button("開始", key="btn_3"):
             res_d, res_s = [], []
             prog = st.progress(0)
             total = len(df_r)
             for i, r in df_r.iterrows():
-                if stop_3: 
-                    st.warning("已停止"); break
-                
-                if pd.notna(r[c_d]): res_d.append(get_gemini_response(create_refine_prompt(str(r[c_d]), lim), api_key, selected_model))
-                else: res_d.append("")
-                
-                if c_s != "(不處理)" and pd.notna(r[c_s]): res_s.append(get_gemini_response(create_spec_prompt(str(r[c_s])), api_key, selected_model))
-                else: res_s.append("")
-                
-                if (i+1)%20 == 0:
-                    temp_df = df_r.iloc[:len(res_d)].copy()
-                    temp_df['精簡_AI'] = res_d
-                    if c_s != "(不處理)": temp_df['規格_AI'] = res_s
-                    auto_save_to_local(temp_df.to_dict('records'), "backup_refine.xlsx")
-                    st.toast("已自動備份")
-                    
+                if stop_3: st.warning("已停止"); break
+                res_d.append(get_gemini_response(create_refine_prompt(str(r[c_d]), lim), api_key, selected_model) if pd.notna(r[c_d]) else "")
+                res_s.append(get_gemini_response(create_spec_prompt(str(r[c_s])), api_key, selected_model) if c_s != "(不處理)" and pd.notna(r[c_s]) else "")
+                if (i+1)%20 == 0: 
+                    temp = df_r.iloc[:len(res_d)].copy()
+                    temp['精簡_AI'] = res_d
+                    if c_s != "(不處理)": temp['規格_AI'] = res_s
+                    auto_save_to_local(temp.to_dict('records'), "backup_refine.xlsx")
                 prog.progress((i+1)/total, text=f"{int((i+1)/total*100)}%")
                 time.sleep(0.5)
-            
             df_r = df_r.iloc[:len(res_d)]
             df_r['精簡_AI'] = res_d
             if c_s != "(不處理)": df_r['規格_AI'] = res_s
-            
             out = io.BytesIO()
             with pd.ExcelWriter(out, engine='openpyxl') as w: df_r.to_excel(w, index=False)
             st.download_button("下載", out.getvalue(), "refined.xlsx")
