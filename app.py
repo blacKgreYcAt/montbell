@@ -14,7 +14,7 @@ from openpyxl.styles import PatternFill, Font, Alignment
 # 0. 頁面全域設定
 # ==========================================
 st.set_page_config(
-    page_title="Montbell 自動化中心 v3.8 (精準版)",
+    page_title="Montbell 自動化中心 v3.9 (強韌容錯版)",
     page_icon="🏔️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -50,22 +50,43 @@ def set_page(page_name):
 # ==========================================
 # 1. 核心邏輯與工具函式
 # ==========================================
-def get_gemini_response(prompt, api_key, model_name):
+def get_gemini_response(prompt, api_key, model_name, retry=True):
+    """
+    呼叫 Gemini API (包含重試與錯誤處理)
+    retry: 是否在失敗時嘗試簡化 Prompt 重試
+    """
     if not api_key: return "Error: 請輸入 Key"
     try:
         genai.configure(api_key=api_key)
+        
+        # 安全設定：全部放行
         safety_settings = {
             HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
         }
+        
         generation_config = {"temperature": 0.2, "top_p": 0.8, "top_k": 40, "max_output_tokens": 2048}
         model = genai.GenerativeModel(model_name.strip(), generation_config=generation_config)
+        
         response = model.generate_content(prompt, safety_settings=safety_settings)
-        return response.text.strip()
+        
+        # [v3.9] 安全存取 response.text
+        try:
+            return response.text.strip()
+        except ValueError:
+            # 捕捉 "Invalid operation" (通常是被 Safety 攔截)
+            # 嘗試進行一次「簡化重試」
+            if retry:
+                # 簡化 Prompt，去除角色設定，降低被過濾機率
+                simple_prompt = f"Translate the following Japanese text to Traditional Chinese (Taiwan): {prompt.split('原文：')[-1]}"
+                print("Safety block triggered. Retrying with simple prompt...")
+                return get_gemini_response(simple_prompt, api_key, model_name, retry=False)
+            
+            return "Error: 內容被安全性攔截 (無法翻譯)"
+            
     except Exception as e:
-        if "SAFETY" in str(e): return "Error: 內容被安全性攔截"
         return f"Error: {str(e)}"
 
 def get_available_models(api_key):
@@ -79,8 +100,6 @@ def scrape_montbell_single(model):
     headers = {'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'ja-JP'}
     base_url = "https://webshop.montbell.jp/"
     search_url = "https://webshop.montbell.jp/goods/list_search.php?top_sk="
-    
-    # [v3.8] 欄位簡化，只保留指定項目
     info = {'型號': model, '商品名': '', '商品描述': '', '規格': '', '商品URL': ''}
     
     try:
@@ -104,14 +123,12 @@ def scrape_montbell_single(model):
             else:
                 if soup.title: info['商品名'] = soup.title.text.split('|')[0].strip()
 
-            # [v3.8] 移除價格與機能抓取，專注描述與規格
             desc = soup.select('.column1.type01 .innerCont p')
             if desc: info['商品描述'] = desc[0].text.strip()
             
             spec = soup.select('.column1.type01, div.explanationBox')
             for s in spec:
                 if '仕様' in s.text: info['規格'] = s.text.strip()
-            
             if not info['規格']:
                 sf = soup.select_one('div.explanationBox')
                 if sf: info['規格'] = sf.text.strip()
@@ -151,9 +168,9 @@ with st.sidebar:
         except Exception as e: st.error(f"❌ 失敗: {e}")
         
     st.markdown("---")
-    st.info("ℹ️ **v3.8 精準版**：\n只抓取並處理「描述」與「規格」，產出包含 原文/翻譯/AI精簡 的完整報表。")
+    st.info("ℹ️ **v3.9 更新**：\n1. 修正「安全性攔截」導致的 Error 錯誤訊息。\n2. 加入自動重試機制，提升翻譯成功率。\n3. 阻斷錯誤擴散，翻譯失敗時不進行精簡。")
 
-st.title("🏔️ Montbell 自動化中心 v3.8")
+st.title("🏔️ Montbell 自動化中心 v3.9")
 
 nav1, nav2, nav3, nav4 = st.columns(4)
 with nav1:
@@ -214,18 +231,15 @@ if st.session_state.current_page == 'all_in_one':
                         status_box.update(label=f"⏳ [{i+1}/{total}] 正在處理: {m} ({pct}%)")
                         
                         try:
-                            # 1. 爬蟲 (只抓描述與規格)
+                            # 1. 爬蟲
                             raw = scrape_montbell_single(m)
                             
-                            # 準備輸出的資料結構
                             row_data = {
                                 '型號': raw['型號'],
-                                '商品名': raw['商品名'], # 保留但不翻譯
+                                '商品名': raw['商品名'],
                                 '商品URL': raw['商品URL'],
-                                # 原文
                                 '商品描述_原文': raw['商品描述'],
                                 '規格_原文': raw['規格'],
-                                # 翻譯與優化 (預設空值)
                                 '商品描述_翻譯': '',
                                 '規格_翻譯': '',
                                 '商品描述_AI精簡': '',
@@ -233,22 +247,29 @@ if st.session_state.current_page == 'all_in_one':
                             }
 
                             # 2. 翻譯與優化
-                            # 寬容判斷：只要有描述或規格，就處理
                             has_data = raw['商品描述'] or raw['規格']
                             
                             if has_data:
                                 # 翻譯
                                 if raw['商品描述']:
-                                    trans_desc = get_gemini_response(create_trans_prompt(raw['商品描述']), api_key, selected_model)
-                                    row_data['商品描述_翻譯'] = trans_desc
-                                    # 優化
-                                    row_data['商品描述_AI精簡'] = get_gemini_response(create_refine_prompt(trans_desc, limit), api_key, selected_model)
-                                
+                                    desc_res = get_gemini_response(create_trans_prompt(raw['商品描述']), api_key, selected_model)
+                                    row_data['商品描述_翻譯'] = desc_res
+                                    
+                                    # [v3.9 防呆] 只有當翻譯成功(沒有Error)時，才進行優化
+                                    if "Error" not in desc_res:
+                                        row_data['商品描述_AI精簡'] = get_gemini_response(create_refine_prompt(desc_res, limit), api_key, selected_model)
+                                    else:
+                                        row_data['商品描述_AI精簡'] = "" # 保持空白，避免優化錯誤訊息
+
                                 if raw['規格']:
-                                    trans_spec = get_gemini_response(create_trans_prompt(raw['規格']), api_key, selected_model)
-                                    row_data['規格_翻譯'] = trans_spec
-                                    # 優化
-                                    row_data['規格_AI精簡'] = get_gemini_response(create_spec_prompt(trans_spec), api_key, selected_model)
+                                    spec_res = get_gemini_response(create_trans_prompt(raw['規格']), api_key, selected_model)
+                                    row_data['規格_翻譯'] = spec_res
+                                    
+                                    if "Error" not in spec_res:
+                                        row_data['規格_AI精簡'] = get_gemini_response(create_spec_prompt(spec_res), api_key, selected_model)
+                                    else:
+                                        row_data['規格_AI精簡'] = ""
+
                             else:
                                 row_data['商品名'] = row_data['商品名'] + " (查無資料)"
 
@@ -268,10 +289,8 @@ if st.session_state.current_page == 'all_in_one':
                     
                     status_box.update(label="✅ 任務結束！", state="complete", expanded=False)
                     
-                    # 整理最終 DataFrame 順序
                     final_cols = ['型號', '商品名', '商品描述_原文', '規格_原文', '商品描述_翻譯', '規格_翻譯', '商品描述_AI精簡', '規格_AI精簡', '商品URL']
                     df_final = pd.DataFrame(results)
-                    # 確保欄位存在 (防止全空時報錯)
                     for col in final_cols:
                         if col not in df_final.columns: df_final[col] = ""
                     df_final = df_final[final_cols]
@@ -326,7 +345,8 @@ elif st.session_state.current_page == 'translator':
                 for i, r in new_df.iterrows():
                     if stop_2: break
                     if pd.notna(r[col]):
-                        new_df.at[i, f"{col}_TW"] = get_gemini_response(create_trans_prompt(str(r[col])), api_key, selected_model)
+                        res = get_gemini_response(create_trans_prompt(str(r[col])), api_key, selected_model)
+                        new_df.at[i, f"{col}_TW"] = res
                     curr += 1
                     if curr % 20 == 0: auto_save_to_local(new_df.to_dict('records'), "backup_trans.xlsx")
                     prog.progress(curr/total, text=f"{int(curr/total*100)}%")
@@ -351,8 +371,15 @@ elif st.session_state.current_page == 'refiner':
             total = len(df_r)
             for i, r in df_r.iterrows():
                 if stop_3: st.warning("已停止"); break
-                res_d.append(get_gemini_response(create_refine_prompt(str(r[c_d]), lim), api_key, selected_model) if pd.notna(r[c_d]) else "")
-                res_s.append(get_gemini_response(create_spec_prompt(str(r[c_s])), api_key, selected_model) if c_s != "(不處理)" and pd.notna(r[c_s]) else "")
+                
+                d_val = get_gemini_response(create_refine_prompt(str(r[c_d]), lim), api_key, selected_model) if pd.notna(r[c_d]) else ""
+                if "Error" in d_val: d_val = "" # 如果優化時也報錯，就留白
+                res_d.append(d_val)
+                
+                s_val = get_gemini_response(create_spec_prompt(str(r[c_s])), api_key, selected_model) if c_s != "(不處理)" and pd.notna(r[c_s]) else ""
+                if "Error" in s_val: s_val = ""
+                res_s.append(s_val)
+                
                 if (i+1)%20 == 0: 
                     temp = df_r.iloc[:len(res_d)].copy()
                     temp['精簡_AI'] = res_d
