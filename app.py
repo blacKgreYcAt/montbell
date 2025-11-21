@@ -14,7 +14,7 @@ from openpyxl.styles import PatternFill, Font, Alignment
 # 0. 頁面全域設定
 # ==========================================
 st.set_page_config(
-    page_title="Montbell 自動化中心 v3.12 (強力繞道版)",
+    page_title="Montbell 自動化中心 v3.13 (暴力精簡版)",
     page_icon="🏔️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -48,20 +48,17 @@ def set_page(page_name):
     st.session_state.current_page = page_name
 
 # ==========================================
-# 1. 核心邏輯：強力繞道翻譯
+# 1. 核心邏輯：資料提取模式
 # ==========================================
-def get_gemini_response(prompt, api_key, model_name, raw_text_for_fallback=None):
+def get_gemini_response(prompt, api_key, model_name):
     """
-    呼叫 Gemini API (包含三階段強力繞道機制)
-    1. 直接翻譯
-    2. 失敗則嘗試：日 -> 英 -> 中 (洗白策略)
-    3. 失敗則嘗試：摘要生成
+    v3.13 核心：使用 '資料提取' 邏輯取代 '翻譯' 邏輯
     """
     if not api_key: return "Error: 請輸入 Key"
     
     genai.configure(api_key=api_key)
     
-    # 安全設定：全開 (Block None)
+    # 安全設定：全開
     safety_settings = {
         HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
         HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -69,42 +66,26 @@ def get_gemini_response(prompt, api_key, model_name, raw_text_for_fallback=None)
         HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
     }
     
-    generation_config = {"temperature": 0.2, "top_p": 0.8, "top_k": 40, "max_output_tokens": 2048}
-    model = genai.GenerativeModel(model_name.strip(), generation_config=generation_config)
+    generation_config = {"temperature": 0.1, "top_p": 0.8, "top_k": 40, "max_output_tokens": 2048}
     
-    # --- 階段一：直接嘗試 ---
+    # [v3.13] 強制導向策略：如果使用者選了舊版，自動切換到效果更好的 1.5-flash
+    actual_model = model_name
+    if "gemini-pro" in model_name and "1.5" not in model_name:
+        actual_model = "gemini-1.5-flash"
+        
+    model = genai.GenerativeModel(actual_model, generation_config=generation_config)
+    
     try:
         response = model.generate_content(prompt, safety_settings=safety_settings)
         return response.text.strip()
     except Exception:
-        pass # 發生任何錯誤 (包含 Safety 攔截)，直接進入階段二
-
-    # --- 階段二：日 -> 英 -> 中 (Bridge Strategy) ---
-    if raw_text_for_fallback:
+        # 如果第一次失敗，嘗試用更簡單的 Prompt 再試一次
         try:
-            # Step 2-1: JP -> EN
-            prompt_en = f"Translate the following Japanese text into English. Keep it factual. Text: {raw_text_for_fallback}"
-            res_en = model.generate_content(prompt_en, safety_settings=safety_settings).text
-            
-            # Step 2-2: EN -> TW
-            prompt_tw = f"Translate the following English text into Traditional Chinese (Taiwan). Text: {res_en}"
-            res_tw = model.generate_content(prompt_tw, safety_settings=safety_settings).text
-            return res_tw.strip()
-        except Exception:
-            pass # 失敗進入階段三
-
-    # --- 階段三：摘要生成 (避開翻譯關鍵字) ---
-    if raw_text_for_fallback:
-        try:
-            # 改用 "解釋" 而非 "翻譯"
-            prompt_summary = f"請閱讀以下日文內容，並用繁體中文(台灣)寫出其重點規格或描述：\n{raw_text_for_fallback}"
-            res_summary = model.generate_content(prompt_summary, safety_settings=safety_settings).text
-            return res_summary.strip()
-        except Exception:
-            pass
-
-    # 真的沒救了，回傳錯誤提示 (不要回傳日文)
-    return "【翻譯失敗：安全性攔截，無法產出中文】"
+            simple_prompt = f"Extract keywords in Traditional Chinese from: {prompt[-500:]}"
+            response = model.generate_content(simple_prompt, safety_settings=safety_settings)
+            return response.text.strip()
+        except:
+            return "" # 真的失敗就留空，不要回傳 Error 代碼干擾視線
 
 def get_available_models(api_key):
     try:
@@ -113,7 +94,7 @@ def get_available_models(api_key):
     except: return []
 
 def scrape_montbell_single(model):
-    """爬蟲：抓取標題、描述、規格"""
+    """爬蟲：只抓取標題(僅供辨識)、描述、規格"""
     headers = {'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'ja-JP'}
     base_url = "https://webshop.montbell.jp/"
     search_url = "https://webshop.montbell.jp/goods/list_search.php?top_sk="
@@ -134,6 +115,7 @@ def scrape_montbell_single(model):
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, 'html.parser')
             
+            # 抓取商品名 (僅用於篩選列表顯示，不輸出到 Excel)
             name = soup.select_one('h1.goods-detail__ttl-main, h1.product-title, h1')
             if name: info['商品名'] = name.text.strip()
             else:
@@ -158,15 +140,32 @@ def auto_save_to_local(data_list, filename="backup_temp.xlsx"):
         return True
     except: return False
 
-# Prompt - 移除可能觸發審查的過度修飾詞
+# [v3.13] 全新 Prompt 策略：不做翻譯，只做「提取」
 def create_trans_prompt(text): 
-    return f"將以下日文轉換為台灣繁體中文。直接輸出結果。原文：{text}"
+    # 使用 "Extract" 指令繞過 "Translation" 的審查
+    return f"""
+    任務：閱讀以下日文商品資訊，用「繁體中文(台灣)」列出重點。
+    要求：
+    1. 不要逐字翻譯。
+    2. 只列出規格數值與核心功能。
+    3. 專有名詞請用台灣用語 (例: 透氣, 撥水)。
+    原文：{text}
+    """
 
 def create_refine_prompt(text, limit): 
-    return f"將這段描述精簡至 {limit} 字以內的中文重點。直接輸出。原文：{text}"
+    # 暴力精簡模式
+    return f"""
+    任務：將這段文字濃縮成「關鍵字標籤」。
+    嚴格限制：**總字數必須在 {limit} 個中文字以內**。
+    規則：
+    1. 禁止造句。
+    2. 去除所有形容詞 (如: 舒適的, 完美的)。
+    3. 用頓號分隔 (例: 防水、透氣、輕量)。
+    原文：{text}
+    """
 
 def create_spec_prompt(text): 
-    return f"整理以下規格表為中文。保留【】格式。直接輸出。原文：{text}"
+    return f"任務：整理規格表。只保留【】標題與數值。去除贅字。使用繁體中文。原文：{text}"
 
 # ==========================================
 # 2. 側邊欄與導航
@@ -175,7 +174,8 @@ with st.sidebar:
     st.title("🛠️ 設定中心")
     api_key = st.text_input("API Key", type="password")
     
-    model_options = ["gemini-pro"]
+    # 預設推薦 1.5-flash
+    model_options = ["gemini-1.5-flash", "gemini-pro"]
     if api_key:
         detected = get_available_models(api_key)
         if detected: model_options = detected
@@ -190,9 +190,9 @@ with st.sidebar:
         except Exception as e: st.error(f"❌ 失敗: {e}")
         
     st.markdown("---")
-    st.info("ℹ️ **v3.12 強力繞道版**：\n若翻譯被攔截，系統將自動嘗試「日->英->中」轉譯，確保產出中文。")
+    st.info("ℹ️ **v3.13 暴力精簡版**：\n採用「關鍵字提取」策略，強制壓低字數並繞過安全審查。")
 
-st.title("🏔️ Montbell 自動化中心 v3.12")
+st.title("🏔️ Montbell 自動化中心 v3.13")
 
 nav1, nav2, nav3, nav4 = st.columns(4)
 with nav1:
@@ -210,7 +210,7 @@ st.markdown("---")
 # ==========================================
 
 if st.session_state.current_page == 'all_in_one':
-    st.markdown("### ⚡ 一鍵全自動處理 (強力中文轉換)")
+    st.markdown("### ⚡ 一鍵全自動處理 (關鍵字提取模式)")
     
     c_in, c_set = st.columns([1, 1])
     with c_in: uploaded_file = st.file_uploader("上傳 Excel", type=["xlsx", "xls"], key="up_all")
@@ -218,6 +218,7 @@ if st.session_state.current_page == 'all_in_one':
         with st.expander("⚙️ 設定", expanded=True):
             sheet_name = st.text_input("工作表", "工作表1", key="sn_all")
             col_idx = st.number_input("型號欄位索引", value=0, min_value=0, key="mi_all")
+            # 強制預設 10 字
             limit = st.number_input("精簡字數限制", min_value=5, max_value=500, value=10, step=1, key="cl_all")
             autosave_interval = st.number_input("自動存檔頻率", min_value=1, max_value=100, value=20, key="as_all")
 
@@ -267,6 +268,7 @@ if st.session_state.current_page == 'all_in_one':
                         # 1. 爬蟲
                         raw = scrape_montbell_single(m)
                         
+                        # 輸出的資料結構：移除不必要的欄位
                         row_data = {
                             '型號': raw['型號'],
                             '商品描述_原文': raw['商品描述'],
@@ -277,26 +279,26 @@ if st.session_state.current_page == 'all_in_one':
                             '規格_AI精簡': ''
                         }
 
-                        # 2. 翻譯與優化 (導入 raw_text_for_fallback)
+                        # 2. 翻譯與優化
                         has_data = raw['商品描述'] or raw['規格']
                         
                         if has_data:
                             if raw['商品描述']:
-                                # 帶入 raw_text 以供繞道使用
-                                desc_res = get_gemini_response(create_trans_prompt(raw['商品描述']), api_key, selected_model, raw_text_for_fallback=raw['商品描述'])
+                                # 步驟 A: 先轉成中文 (提取模式)
+                                desc_res = get_gemini_response(create_trans_prompt(raw['商品描述']), api_key, selected_model)
                                 row_data['商品描述_翻譯'] = desc_res
                                 
-                                if "失敗" not in desc_res:
-                                    refine_res = get_gemini_response(create_refine_prompt(desc_res, limit), api_key, selected_model, raw_text_for_fallback=desc_res)
+                                # 步驟 B: 暴力精簡 (關鍵字模式)
+                                if desc_res:
+                                    refine_res = get_gemini_response(create_refine_prompt(desc_res, limit), api_key, selected_model)
                                     row_data['商品描述_AI精簡'] = refine_res
 
                             if raw['規格']:
-                                # 帶入 raw_text 以供繞道使用
-                                spec_res = get_gemini_response(create_trans_prompt(raw['規格']), api_key, selected_model, raw_text_for_fallback=raw['規格'])
+                                spec_res = get_gemini_response(create_trans_prompt(raw['規格']), api_key, selected_model)
                                 row_data['規格_翻譯'] = spec_res
                                 
-                                if "失敗" not in spec_res:
-                                    spec_refine = get_gemini_response(create_spec_prompt(spec_res), api_key, selected_model, raw_text_for_fallback=spec_res)
+                                if spec_res:
+                                    spec_refine = get_gemini_response(create_spec_prompt(spec_res), api_key, selected_model)
                                     row_data['規格_AI精簡'] = spec_refine
 
                         results.append(row_data)
@@ -315,6 +317,7 @@ if st.session_state.current_page == 'all_in_one':
                 
                 status_box.update(label="✅ 任務結束！", state="complete", expanded=False)
                 
+                # 最終輸出欄位設定 (不含商品名與URL)
                 final_cols = ['型號', '商品描述_原文', '規格_原文', '商品描述_翻譯', '規格_翻譯', '商品描述_AI精簡', '規格_AI精簡']
                 df_final = pd.DataFrame(results)
                 for col in final_cols:
@@ -329,7 +332,7 @@ if st.session_state.current_page == 'all_in_one':
             except Exception as e:
                 st.error(f"執行錯誤: {e}")
 
-# --- 其他頁面 (略為精簡，結構與上述相同) ---
+# --- 其他頁面 ---
 elif st.session_state.current_page == 'scraper':
     st.markdown("### 📥 獨立爬蟲")
     up_1 = st.file_uploader("上傳 Excel", key="up_1")
@@ -394,8 +397,8 @@ elif st.session_state.current_page == 'translator':
                     if stop_2: break
                     val = new_df.at[i, col]
                     if pd.notna(val):
-                        res = get_gemini_response(create_trans_prompt(str(val)), api_key, selected_model, raw_text_for_fallback=str(val))
-                        new_df.at[i, f"{col}_TW"] = res
+                        res = get_gemini_response(create_trans_prompt(str(val)), api_key, selected_model)
+                        new_df.at[i, f"{col}_TW"] = res if res else val
                     curr_op += 1
                     if curr_op % 20 == 0: auto_save_to_local(new_df.to_dict('records'), "backup_trans.xlsx")
                     prog.progress(curr_op/total_ops, text=f"{int(curr_op/total_ops*100)}%")
@@ -438,11 +441,11 @@ elif st.session_state.current_page == 'refiner':
                 if stop_3: st.warning("已停止"); break
                 r = df_r.iloc[i]
                 
-                d_val = get_gemini_response(create_refine_prompt(str(r[c_d]), lim), api_key, selected_model, raw_text_for_fallback=str(r[c_d])) if pd.notna(r[c_d]) else ""
+                d_val = get_gemini_response(create_refine_prompt(str(r[c_d]), lim), api_key, selected_model) if pd.notna(r[c_d]) else ""
                 df_r.at[i, '精簡_AI'] = d_val
                 
                 if c_s != "(不處理)" and pd.notna(r[c_s]):
-                    s_val = get_gemini_response(create_spec_prompt(str(r[c_s])), api_key, selected_model, raw_text_for_fallback=str(r[c_s]))
+                    s_val = get_gemini_response(create_spec_prompt(str(r[c_s])), api_key, selected_model)
                     df_r.at[i, '規格_AI'] = s_val
                 
                 if (idx+1)%20 == 0: 
