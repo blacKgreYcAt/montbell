@@ -13,7 +13,7 @@ from openpyxl.styles import PatternFill, Font, Alignment
 # 0. 頁面全域設定
 # ==========================================
 st.set_page_config(
-    page_title="Montbell 自動化中心 v3.1",
+    page_title="Montbell 自動化中心 v3.2",
     page_icon="🏔️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -46,22 +46,35 @@ def get_gemini_response(prompt, api_key, model_name):
     try:
         genai.configure(api_key=api_key)
         generation_config = {
-            "temperature": 0.2, # 低溫度確保翻譯準確
+            "temperature": 0.2,
             "top_p": 0.8,
             "top_k": 40,
             "max_output_tokens": 2048,
         }
-        model = genai.GenerativeModel(model_name, generation_config=generation_config)
+        # 確保模型名稱沒有多餘空白
+        clean_model_name = model_name.strip()
+        model = genai.GenerativeModel(clean_model_name, generation_config=generation_config)
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        # 如果遇到 404 錯誤，嘗試給出更友善的提示
-        if "404" in str(e):
-            return f"Error: 模型名稱錯誤或不支援 ({model_name})。建議切換至 gemini-1.5-flash。"
         return f"Error: {str(e)}"
 
+def get_available_models(api_key):
+    """[v3.2 新增] 自動偵測目前環境可用的模型列表"""
+    try:
+        genai.configure(api_key=api_key)
+        models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                # 只取 'models/' 後面的名稱，例如 'gemini-pro'
+                name = m.name.replace('models/', '')
+                models.append(name)
+        return models
+    except Exception as e:
+        return []
+
 def scrape_montbell_single(model):
-    """爬取單一商品邏輯 (回傳 dict)"""
+    """爬取單一商品邏輯"""
     headers = {'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'ja-JP'}
     base_url = "https://webshop.montbell.jp/"
     search_url = "https://webshop.montbell.jp/goods/list_search.php?top_sk="
@@ -69,11 +82,9 @@ def scrape_montbell_single(model):
     info = {'型號': model, '商品名': '', '價格': '', '商品描述': '', '規格': '', '機能': '', '商品URL': ''}
     
     try:
-        # 1. 直接訪問
         target_url = f"{base_url}goods/disp.php?product_id={model}"
         resp = requests.get(target_url, headers=headers, timeout=10)
         
-        # 2. 搜尋備案
         if resp.status_code != 200:
             search_resp = requests.get(f"{search_url}{model}", headers=headers, timeout=10)
             if search_resp.status_code == 200:
@@ -114,93 +125,95 @@ def create_trans_prompt(text):
     return f"""
     角色：專業戶外用品譯者 (台灣市場)。
     任務：將日文翻譯為繁體中文 (台灣)。
-    原則：
-    1. 專有名詞使用台灣戶外圈習慣用語 (如：透湿->透氣)。
-    2. 語氣通順自然。
-    3. 不要有任何解釋，直接輸出翻譯結果。
+    原則：1.專有名詞使用台灣習慣用語(如:透湿->透氣)。2.語氣通順自然。3.不解釋，直接輸出翻譯。
     原文：{text}
     """
 
 def create_refine_prompt(text, limit):
-    return f"""
-    任務：提取商品核心賣點並精簡。
-    限制：{limit}個中文字內。
-    原文：{text}
-    """
+    return f"任務：提取商品核心賣點並精簡。限制：{limit}個中文字內。原文：{text}"
 
 def create_spec_prompt(text):
-    return f"""
-    任務：優化並精簡產品規格表。
-    規則：保留【】內標題，去除贅字，使用縮寫，保持換行格式。
-    原文：{text}
-    """
+    return f"任務：優化並精簡產品規格表。規則：保留【】內標題，去除贅字，使用縮寫，保持換行。原文：{text}"
 
 # ==========================================
-# 2. 側邊欄：全域設定
+# 2. 側邊欄：全域設定 (v3.2 智能偵測版)
 # ==========================================
 with st.sidebar:
     st.title("🛠️ 設定中心")
-    st.info("👋 Hi Benjamin, v3.1 Fix")
+    st.info("👋 Hi Benjamin, v3.2 Auto-Detect")
     
     st.markdown("### 1. API 金鑰")
     api_key = st.text_input("Google Gemini API Key", type="password", placeholder="貼上 Key...")
     
-    # 新增：API 檢測按鈕
-    col_test, col_status = st.columns([1, 2])
-    with col_test:
-        test_btn = st.button("測試連線")
-    
-    if test_btn and api_key:
-        try:
-            genai.configure(api_key=api_key)
-            # [FIX] 這裡強制使用最穩定的 Flash 模型進行測試，避免 gemini-pro 404 錯誤
-            m = genai.GenerativeModel("gemini-1.5-flash")
-            response = m.generate_content("Test connection")
-            st.sidebar.success("✅ API 連線成功！")
-        except Exception as e:
-            st.sidebar.error(f"❌ 連線失敗: {e}")
-
     st.markdown("### 2. 模型選擇")
-    # [FIX] 移除了舊版 gemini-pro，改用明確版本號
-    model_options = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"]
-    selected_model = st.selectbox("AI 模型", model_options, index=0, help="Flash最快(推薦)，Pro品質較好")
     
+    # [v3.2] 預設的 fallback 選項，以防偵測失敗
+    default_options = ["gemini-pro"] 
+    model_options = default_options
+    
+    if api_key:
+        # [v3.2] 嘗試自動獲取可用模型列表
+        detected_models = get_available_models(api_key)
+        if detected_models:
+            model_options = detected_models
+            st.success(f"已偵測到 {len(detected_models)} 個可用模型")
+        else:
+            st.warning("無法自動偵測模型，將使用預設列表。")
+    
+    selected_model = st.selectbox(
+        "AI 模型", 
+        model_options, 
+        index=0,
+        help="此列表由系統自動偵測您的 API Key 可用權限。"
+    )
+    
+    # 測試按鈕
+    if st.button("測試目前選擇的模型"):
+        if not api_key:
+            st.error("請先輸入 API Key")
+        else:
+            try:
+                genai.configure(api_key=api_key)
+                m = genai.GenerativeModel(selected_model)
+                m.generate_content("Hello")
+                st.success(f"✅ {selected_model} 連線成功！")
+            except Exception as e:
+                st.error(f"❌ 測試失敗: {e}")
+
     st.markdown("---")
     st.caption("Design for Montbell Workflow")
 
 # ==========================================
 # 3. 主畫面
 # ==========================================
-st.title("🏔️ Montbell 自動化中心 v3.1")
+st.title("🏔️ Montbell 自動化中心 v3.2")
 
-tabs = st.tabs(["⚡ 一鍵全自動 (All-in-One)", "📥 分步：爬蟲", "🈺 分步：翻譯", "✨ 分步：優化"])
+tabs = st.tabs(["⚡ 一鍵全自動", "📥 分步：爬蟲", "🈺 分步：翻譯", "✨ 分步：優化"])
 
 # ==========================================
-# TAB 1: 一鍵全自動 (All-in-One)
+# TAB 1: 一鍵全自動
 # ==========================================
 with tabs[0]:
     st.header("⚡ 一鍵全自動處理流程")
-    st.caption("上傳型號表 -> 系統自動：1.爬取官網 -> 2.翻譯成中文 -> 3.精簡優化 -> 輸出最終檔。")
     
     col_in, col_set = st.columns([1, 1])
     with col_in:
         uploaded_file_all = st.file_uploader("上傳型號 Excel", type=["xlsx", "xls"], key="up_all")
     with col_set:
-        with st.expander("參數設定 (點擊展開)", expanded=True):
+        with st.expander("參數設定", expanded=True):
             sheet_name_all = st.text_input("工作表名稱", value="工作表1", key="sn_all")
-            model_col_idx_all = st.number_input("型號欄位索引 (A=0, B=1...)", value=0, min_value=0, key="mi_all")
-            char_limit_all = st.number_input("描述精簡字數限制", value=50, min_value=10, key="cl_all")
+            model_col_idx_all = st.number_input("型號欄位索引", value=0, min_value=0, key="mi_all")
+            char_limit_all = st.number_input("精簡字數限制", value=50, min_value=10, key="cl_all")
             
     if st.button("🚀 啟動全自動排程", type="primary", key="btn_all"):
         if not uploaded_file_all or not api_key:
             st.error("請檢查：1.是否已上傳檔案 2.是否已輸入 API Key")
         else:
             try:
-                # 讀取 Excel
                 df = pd.read_excel(uploaded_file_all, sheet_name=sheet_name_all)
                 models = []
                 for idx, row in df.iterrows():
-                    if idx >= 1: # 假設 Header 後一行開始
+                    if idx >= 1:
                         if model_col_idx_all < len(row):
                             m = str(row.iloc[model_col_idx_all]).strip()
                             if re.match(r'^\d{7}$', m): models.append(m)
@@ -209,62 +222,57 @@ with tabs[0]:
                     st.error("找不到有效型號 (7碼數字)。")
                 else:
                     results_final = []
-                    
-                    # 使用 st.status 顯示複合進度
-                    with st.status(f"正在處理 {len(models)} 筆商品 (爬蟲+翻譯+優化)...", expanded=True) as status:
+                    with st.status(f"正在處理 {len(models)} 筆商品...", expanded=True) as status:
                         prog_bar = st.progress(0)
-                        
                         for i, model in enumerate(models):
-                            status.update(label=f"[{i+1}/{len(models)}] 處理型號：{model} ...")
+                            status.update(label=f"[{i+1}/{len(models)}] 處理型號：{model}")
                             
                             # 1. 爬蟲
-                            raw_data = scrape_montbell_single(model)
+                            raw = scrape_montbell_single(model)
                             
-                            # 2. 翻譯 (針對主要欄位)
-                            trans_data = raw_data.copy()
-                            if raw_data['商品名'] != '未找到':
-                                trans_data['商品名_TW'] = get_gemini_response(create_trans_prompt(raw_data['商品名']), api_key, selected_model)
-                                trans_data['商品描述_TW'] = get_gemini_response(create_trans_prompt(raw_data['商品描述']), api_key, selected_model)
-                                trans_data['規格_TW'] = get_gemini_response(create_trans_prompt(raw_data['規格']), api_key, selected_model)
-                                trans_data['機能_TW'] = get_gemini_response(create_trans_prompt(raw_data['機能']), api_key, selected_model)
+                            # 2. 翻譯
+                            trans = raw.copy()
+                            if raw['商品名'] != '未找到':
+                                trans['商品名_TW'] = get_gemini_response(create_trans_prompt(raw['商品名']), api_key, selected_model)
+                                trans['商品描述_TW'] = get_gemini_response(create_trans_prompt(raw['商品描述']), api_key, selected_model)
+                                trans['規格_TW'] = get_gemini_response(create_trans_prompt(raw['規格']), api_key, selected_model)
+                                trans['機能_TW'] = get_gemini_response(create_trans_prompt(raw['機能']), api_key, selected_model)
                             else:
-                                trans_data['商品名_TW'] = "查無資料"
+                                trans['商品名_TW'] = "查無資料"
                             
-                            # 3. 優化 (精簡)
-                            if raw_data['商品名'] != '未找到':
-                                trans_data['精簡描述_AI'] = get_gemini_response(create_refine_prompt(trans_data['商品描述_TW'], char_limit_all), api_key, selected_model)
-                                trans_data['規格_結構化_AI'] = get_gemini_response(create_spec_prompt(trans_data['規格_TW']), api_key, selected_model)
+                            # 3. 優化
+                            if raw['商品名'] != '未找到':
+                                trans['精簡描述_AI'] = get_gemini_response(create_refine_prompt(trans['商品描述_TW'], char_limit_all), api_key, selected_model)
+                                trans['規格_結構化_AI'] = get_gemini_response(create_spec_prompt(trans['規格_TW']), api_key, selected_model)
                             else:
-                                trans_data['精簡描述_AI'] = ""
-                                trans_data['規格_結構化_AI'] = ""
+                                trans['精簡描述_AI'] = ""
+                                trans['規格_結構化_AI'] = ""
 
-                            results_final.append(trans_data)
+                            results_final.append(trans)
                             prog_bar.progress((i+1)/len(models))
-                            time.sleep(1) # 避免 API 過熱
+                            time.sleep(1) 
                         
-                        status.update(label="✅ 全自動流程執行完畢！", state="complete", expanded=False)
+                        status.update(label="✅ 完成！", state="complete", expanded=False)
 
-                    # 輸出
                     df_final = pd.DataFrame(results_final)
-                    st.success(f"完成！共產出 {len(df_final)} 筆資料。")
-                    
+                    st.success(f"完成！共 {len(df_final)} 筆。")
                     out = io.BytesIO()
-                    with pd.ExcelWriter(out, engine='openpyxl') as writer:
-                        df_final.to_excel(writer, index=False)
-                    st.download_button("📥 下載最終完整報表", out.getvalue(), "montbell_full_auto.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+                    with pd.ExcelWriter(out, engine='openpyxl') as w: df_final.to_excel(w, index=False)
+                    st.download_button("📥 下載最終報表", out.getvalue(), "montbell_final.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
             except Exception as e:
                 st.error(f"執行錯誤: {e}")
 
 # ==========================================
-# TAB 2: 爬蟲 (Scraper)
+# TAB 2: 爬蟲 (僅下載)
 # ==========================================
 with tabs[1]:
-    st.header("📥 步驟一：官網爬蟲 (僅下載)")
+    st.header("📥 爬蟲下載")
     uploaded_file = st.file_uploader("上傳 Excel", type=["xlsx", "xls"], key="up_1")
     col1, col2 = st.columns(2)
     with col1:
         sheet_name = st.text_input("工作表", value="工作表1", key="sn_1")
+    with col2:
         model_col_idx = st.number_input("型號欄位索引", value=0, key="mi_1")
         start_row = st.number_input("開始列", value=2, key="sr_1")
     
@@ -285,16 +293,16 @@ with tabs[1]:
             time.sleep(0.5)
         
         df_res = pd.DataFrame(res)
-        st.success("爬取完成")
+        st.success("完成")
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine='openpyxl') as w: df_res.to_excel(w, index=False)
-        st.download_button("下載 Excel", out.getvalue(), "scraped.xlsx")
+        st.download_button("下載", out.getvalue(), "scraped.xlsx")
 
 # ==========================================
-# TAB 3: 翻譯 (Translator)
+# TAB 3: 翻譯 (僅翻譯)
 # ==========================================
 with tabs[2]:
-    st.header("🈺 步驟二：AI 翻譯 (僅翻譯)")
+    st.header("🈺 AI 翻譯")
     up_trans = st.file_uploader("上傳 Excel", type=["xlsx", "xls"], key="up_2")
     if up_trans and api_key:
         df_t = pd.read_excel(up_trans)
@@ -314,13 +322,13 @@ with tabs[2]:
                     time.sleep(0.5)
             out = io.BytesIO()
             with pd.ExcelWriter(out, engine='openpyxl') as w: new_df.to_excel(w, index=False)
-            st.download_button("下載翻譯檔", out.getvalue(), "translated.xlsx")
+            st.download_button("下載", out.getvalue(), "translated.xlsx")
 
 # ==========================================
-# TAB 4: 優化 (Refiner)
+# TAB 4: 優化 (僅優化)
 # ==========================================
 with tabs[3]:
-    st.header("✨ 步驟三：優化精簡 (僅優化)")
+    st.header("✨ 優化精簡")
     up_ref = st.file_uploader("上傳 Excel", type=["xlsx", "xls"], key="up_3")
     if up_ref and api_key:
         df_r = pd.read_excel(up_ref)
@@ -347,4 +355,4 @@ with tabs[3]:
             
             out = io.BytesIO()
             with pd.ExcelWriter(out, engine='openpyxl') as w: df_r.to_excel(w, index=False)
-            st.download_button("下載優化檔", out.getvalue(), "refined.xlsx")
+            st.download_button("下載", out.getvalue(), "refined.xlsx")
