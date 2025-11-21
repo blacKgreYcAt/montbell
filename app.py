@@ -16,7 +16,7 @@ from openpyxl.styles import PatternFill, Font, Alignment
 # 0. 頁面全域設定
 # ==========================================
 st.set_page_config(
-    page_title="Montbell 自動化中心 v3.6.1 (修正版)",
+    page_title="Montbell 自動化中心 v3.6.2 (修復版)",
     page_icon="🏔️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -144,7 +144,7 @@ with st.sidebar:
         except Exception as e: st.error(f"❌ 失敗: {e}")
         
     st.markdown("---")
-    st.info("ℹ️ **v3.6.1 修正版**")
+    st.info("ℹ️ **v3.6.2 修復版**")
 
 st.title("🏔️ Montbell 自動化中心 v3.6")
 
@@ -171,9 +171,12 @@ if st.session_state.current_page == 'all_in_one':
     with c_set:
         with st.expander("⚙️ 設定", expanded=True):
             sheet_name = st.text_input("工作表", "工作表1", key="sn_all")
-            col_idx = st.number_input("型號欄位索引", 0, key="mi_all")
-            limit = st.number_input("字數限制", 50, 10, key="cl_all")
-            autosave_interval = st.number_input("自動存檔頻率", 10, 100, 20)
+            col_idx = st.number_input("型號欄位索引", value=0, min_value=0, key="mi_all")
+            
+            # [FIX] 修正參數順序，並使用具名參數避免錯誤
+            limit = st.number_input("精簡字數限制", min_value=10, max_value=500, value=50, step=10, key="cl_all")
+            
+            autosave_interval = st.number_input("自動存檔頻率", min_value=1, max_value=100, value=20, key="as_all")
 
     stop_requested = st.checkbox("🛑 緊急停止 (勾選後，處理完當前筆數即停止)", key="stop_chk")
 
@@ -181,7 +184,6 @@ if st.session_state.current_page == 'all_in_one':
         if not uploaded_file or not api_key:
             st.error("❌ 資料不全：請檢查 API Key 或 檔案")
         else:
-            # [FIX] 這裡加上了 try ... except 區塊來修復 SyntaxError
             try:
                 df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
                 models = []
