@@ -13,13 +13,13 @@ from openpyxl.styles import PatternFill, Font, Alignment
 # 0. 頁面全域設定
 # ==========================================
 st.set_page_config(
-    page_title="Montbell 商品資料自動化中心",
+    page_title="Montbell 自動化中心 v3.0",
     page_icon="🏔️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 自定義 CSS 優化視覺 (隱藏預設 Footer，優化按鈕樣式)
+# CSS 優化
 st.markdown("""
     <style>
     .stButton>button {
@@ -36,17 +36,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. 核心邏輯函式庫 (Backend Logic)
+# 1. 核心邏輯函式庫
 # ==========================================
 
-def get_gemini_response(prompt, api_key, model_name="gemini-1.5-flash"):
+def get_gemini_response(prompt, api_key, model_name):
     """呼叫 Gemini API 的通用函式"""
     if not api_key:
-        return "Error: 請先輸入 API Key"
+        return "Error: 請輸入 API Key"
     try:
         genai.configure(api_key=api_key)
         generation_config = {
-            "temperature": 0.2,
+            "temperature": 0.2, # 低溫度確保翻譯準確
             "top_p": 0.8,
             "top_k": 40,
             "max_output_tokens": 2048,
@@ -57,312 +57,291 @@ def get_gemini_response(prompt, api_key, model_name="gemini-1.5-flash"):
     except Exception as e:
         return f"Error: {str(e)}"
 
+def scrape_montbell_single(model):
+    """爬取單一商品邏輯 (回傳 dict)"""
+    headers = {'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'ja-JP'}
+    base_url = "https://webshop.montbell.jp/"
+    search_url = "https://webshop.montbell.jp/goods/list_search.php?top_sk="
+    
+    info = {'型號': model, '商品名': '', '價格': '', '商品描述': '', '規格': '', '機能': '', '商品URL': ''}
+    
+    try:
+        # 1. 直接訪問
+        target_url = f"{base_url}goods/disp.php?product_id={model}"
+        resp = requests.get(target_url, headers=headers, timeout=10)
+        
+        # 2. 搜尋備案
+        if resp.status_code != 200:
+            search_resp = requests.get(f"{search_url}{model}", headers=headers, timeout=10)
+            if search_resp.status_code == 200:
+                soup_s = BeautifulSoup(search_resp.text, 'html.parser')
+                link = soup_s.select_one('div.product a, div.goods-container a')
+                if link:
+                    target_url = base_url + link['href'].lstrip('/')
+                    resp = requests.get(target_url, headers=headers, timeout=10)
+        
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            info['商品URL'] = target_url
+            
+            name = soup.select_one('h1.goods-detail__ttl-main, h1')
+            if name: info['商品名'] = name.text.strip()
+            
+            price = soup.select_one('.goods-detail__price, span.selling_price')
+            if price: info['價格'] = price.text.strip()
+            
+            desc = soup.select('.column1.type01 .innerCont p')
+            if desc: info['商品描述'] = desc[0].text.strip()
+            
+            spec = soup.select('.column1.type01, div.explanationBox')
+            for s in spec:
+                if '仕様' in s.text: info['規格'] = s.text.strip()
+                if '機能' in s.text: info['機能'] = s.text.strip()
+            
+            if not info['規格']:
+                spec_fallback = soup.select_one('div.explanationBox')
+                if spec_fallback: info['規格'] = spec_fallback.text.strip()
+                
+    except Exception as e:
+        print(f"Scrape Error {model}: {e}")
+    
+    return info
+
+def create_trans_prompt(text):
+    return f"""
+    角色：專業戶外用品譯者 (台灣市場)。
+    任務：將日文翻譯為繁體中文 (台灣)。
+    原則：
+    1. 專有名詞使用台灣戶外圈習慣用語 (如：透湿->透氣)。
+    2. 語氣通順自然。
+    3. 不要有任何解釋，直接輸出翻譯結果。
+    原文：{text}
+    """
+
+def create_refine_prompt(text, limit):
+    return f"""
+    任務：提取商品核心賣點並精簡。
+    限制：{limit}個中文字內。
+    原文：{text}
+    """
+
+def create_spec_prompt(text):
+    return f"""
+    任務：優化並精簡產品規格表。
+    規則：保留【】內標題，去除贅字，使用縮寫，保持換行格式。
+    原文：{text}
+    """
+
 # ==========================================
 # 2. 側邊欄：全域設定
 # ==========================================
 with st.sidebar:
     st.title("🛠️ 設定中心")
-    st.info("👋 嗨 Benjamin，歡迎回來！")
+    st.info("👋 Hi Benjamin, v3.0 Ready!")
     
-    st.markdown("### 🔑 API 金鑰設定")
-    api_key = st.text_input("Google Gemini API Key", type="password", placeholder="貼上您的 Key...")
+    st.markdown("### 1. API 金鑰")
+    api_key = st.text_input("Google Gemini API Key", type="password", placeholder="貼上 Key...")
     
-    if api_key:
-        st.success("API Key 已載入")
-    else:
-        st.warning("請輸入 Key 以啟用 AI 功能")
-        
+    # 新增：API 檢測按鈕
+    col_test, col_status = st.columns([1, 2])
+    with col_test:
+        test_btn = st.button("測試連線")
+    
+    if test_btn and api_key:
+        try:
+            genai.configure(api_key=api_key)
+            m = genai.GenerativeModel("gemini-pro")
+            m.generate_content("Test")
+            st.sidebar.success("✅ API 連線成功！")
+        except Exception as e:
+            st.sidebar.error(f"❌ 連線失敗: {e}")
+
+    st.markdown("### 2. 模型選擇")
+    model_options = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+    selected_model = st.selectbox("AI 模型", model_options, index=0, help="Flash最快，Pro品質較好")
+    
     st.markdown("---")
-    st.markdown("### ℹ️ 關於工具")
-    st.caption("此工具由 Python 驅動，整合了爬蟲與 Gemini AI，專為 Montbell 資料處理設計。")
-    st.caption("v2.0 - UI Optimized")
+    st.caption("Design for Montbell Workflow")
 
 # ==========================================
-# 3. 主畫面：分頁導航
+# 3. 主畫面
 # ==========================================
-st.title("🏔️ Montbell 商品資料自動化中心")
-st.markdown("請依序執行以下步驟，完成資料的 **獲取**、**在地化** 與 **優化**。")
+st.title("🏔️ Montbell 自動化中心 v3.0")
 
-# 使用 Tabs 取代 Radio Button，視覺更現代
-tab1, tab2, tab3 = st.tabs(["📥 步驟一：官網爬蟲", "🈺 步驟二：AI 翻譯 (TW)", "✨ 步驟三：資料優化"])
+tabs = st.tabs(["⚡ 一鍵全自動 (All-in-One)", "📥 分步：爬蟲", "🈺 分步：翻譯", "✨ 分步：優化"])
 
 # ==========================================
-# TAB 1: 爬蟲 (Scraper)
+# TAB 1: 一鍵全自動 (New!)
 # ==========================================
-with tab1:
-    st.header("Montbell 日本官網資料下載")
-    st.caption("上傳包含「商品型號」的 Excel，系統將自動從官網抓取圖片、價格與規格。")
+with tabs[0]:
+    st.header("⚡ 一鍵全自動處理流程")
+    st.caption("上傳型號表 -> 系統自動：1.爬取官網 -> 2.翻譯成中文 -> 3.精簡優化 -> 輸出最終檔。")
     
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        st.markdown("#### 1. 檔案設定")
-        uploaded_file = st.file_uploader("上傳 Excel 檔案", type=["xlsx", "xls"], key="uploader_1")
-        
-        with st.expander("進階參數設定", expanded=False):
-            sheet_name = st.text_input("工作表名稱", value="工作表1")
-            start_row = st.number_input("資料開始列 (Header後一行)", value=2, min_value=1)
-            model_col_idx = st.number_input("型號欄位索引 (A=0, B=1...)", value=0, min_value=0)
+    col_in, col_set = st.columns([1, 1])
+    with col_in:
+        uploaded_file_all = st.file_uploader("上傳型號 Excel", type=["xlsx", "xls"], key="up_all")
+    with col_set:
+        with st.expander("參數設定 (點擊展開)", expanded=True):
+            sheet_name_all = st.text_input("工作表名稱", value="工作表1", key="sn_all")
+            model_col_idx_all = st.number_input("型號欄位索引 (A=0, B=1...)", value=0, min_value=0, key="mi_all")
+            char_limit_all = st.number_input("描述精簡字數限制", value=50, min_value=10, key="cl_all") # 最低 10 字
             
-    with col2:
-        st.markdown("#### 2. 執行面板")
-        if uploaded_file:
-            # 預覽檔案
-            try:
-                df_preview = pd.read_excel(uploaded_file, sheet_name=sheet_name)
-                st.dataframe(df_preview.head(3), use_container_width=True)
-                st.caption(f"預覽前 3 筆資料。將從第 {start_row} 列開始讀取，型號位於第 {model_col_idx} 欄。")
-                
-                if st.button("🚀 開始爬取資料", type="primary", key="btn_scrape"):
-                    # 讀取並過濾型號
-                    real_start_row = start_row - 1
-                    models = []
-                    for index, row in df_preview.iterrows():
-                        if index < real_start_row: continue
-                        if model_col_idx < len(row):
-                            model = str(row.iloc[model_col_idx]).strip()
-                            if re.match(r'^\d{7}$', model): models.append(model)
-                    
-                    if not models:
-                        st.error("未找到符合格式 (7碼數字) 的型號，請檢查設定。")
-                    else:
-                        # 使用 st.status 顯示進度，介面更乾淨
-                        results = []
-                        with st.status(f"正在爬取 {len(models)} 筆商品...", expanded=True) as status:
-                            progress_bar = st.progress(0)
-                            
-                            # 爬蟲設定
-                            headers = {'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'ja-JP'}
-                            base_url = "https://webshop.montbell.jp/"
-                            
-                            for i, model in enumerate(models):
-                                status.update(label=f"正在處理 ({i+1}/{len(models)}): {model}")
-                                progress_bar.progress((i + 1) / len(models))
-                                
-                                product_info = {'型號': model, '商品名': '未找到', '價格': '', '商品描述': '', '規格': '', '機能': ''}
-                                try:
-                                    # 簡化的爬蟲邏輯 (為節省篇幅，核心邏輯與前版相同)
-                                    target_url = f"{base_url}goods/disp.php?product_id={model}"
-                                    resp = requests.get(target_url, headers=headers, timeout=10)
-                                    if resp.status_code == 200:
-                                        soup = BeautifulSoup(resp.text, 'html.parser')
-                                        product_info['商品URL'] = target_url
-                                        
-                                        name = soup.select_one('h1.goods-detail__ttl-main, h1')
-                                        if name: product_info['商品名'] = name.text.strip()
-                                        
-                                        price = soup.select_one('.goods-detail__price, span.selling_price')
-                                        if price: product_info['價格'] = price.text.strip()
-                                        
-                                        desc = soup.select('.column1.type01 .innerCont p')
-                                        if desc: product_info['商品描述'] = desc[0].text.strip()
-                                        
-                                        spec = soup.select_one('div.explanationBox')
-                                        if spec: product_info['規格'] = spec.text.strip()
-
-                                except Exception as e:
-                                    st.write(f"Error: {model} - {e}")
-                                
-                                results.append(product_info)
-                                time.sleep(1) # 禮貌性延遲
-                                
-                            status.update(label="✅ 爬取完成！", state="complete", expanded=False)
-                        
-                        # 結果處理
-                        result_df = pd.DataFrame(results)
-                        st.success(f"成功獲取 {len(result_df)} 筆資料！")
-                        
-                        # 下載按鈕
-                        output = io.BytesIO()
-                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                            result_df.to_excel(writer, index=False)
-                        
-                        st.download_button(
-                            label="📥 下載爬取結果 (Excel)",
-                            data=output.getvalue(),
-                            file_name="montbell_data_scraped.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-            except Exception as e:
-                st.error(f"讀取 Excel 失敗: {e}")
+    if st.button("🚀 啟動全自動排程", type="primary", key="btn_all"):
+        if not uploaded_file_all or not api_key:
+            st.error("請檢查：1.是否已上傳檔案 2.是否已輸入 API Key")
         else:
-            st.info("請先上傳 Excel 檔案以開始操作。")
+            try:
+                # 讀取 Excel
+                df = pd.read_excel(uploaded_file_all, sheet_name=sheet_name_all)
+                models = []
+                for idx, row in df.iterrows():
+                    if idx >= 1: # 假設 Header 後一行開始
+                        if model_col_idx_all < len(row):
+                            m = str(row.iloc[model_col_idx_all]).strip()
+                            if re.match(r'^\d{7}$', m): models.append(m)
+                
+                if not models:
+                    st.error("找不到有效型號 (7碼數字)。")
+                else:
+                    results_final = []
+                    
+                    # 使用 st.status 顯示複合進度
+                    with st.status(f"正在處理 {len(models)} 筆商品 (爬蟲+翻譯+優化)...", expanded=True) as status:
+                        prog_bar = st.progress(0)
+                        
+                        for i, model in enumerate(models):
+                            status.update(label=f"[{i+1}/{len(models)}] 處理型號：{model} ...")
+                            
+                            # 1. 爬蟲
+                            raw_data = scrape_montbell_single(model)
+                            
+                            # 2. 翻譯 (針對主要欄位)
+                            trans_data = raw_data.copy()
+                            if raw_data['商品名'] != '未找到':
+                                trans_data['商品名_TW'] = get_gemini_response(create_trans_prompt(raw_data['商品名']), api_key, selected_model)
+                                trans_data['商品描述_TW'] = get_gemini_response(create_trans_prompt(raw_data['商品描述']), api_key, selected_model)
+                                trans_data['規格_TW'] = get_gemini_response(create_trans_prompt(raw_data['規格']), api_key, selected_model)
+                                trans_data['機能_TW'] = get_gemini_response(create_trans_prompt(raw_data['機能']), api_key, selected_model)
+                            else:
+                                trans_data['商品名_TW'] = "查無資料"
+                            
+                            # 3. 優化 (精簡)
+                            if raw_data['商品名'] != '未找到':
+                                trans_data['精簡描述_AI'] = get_gemini_response(create_refine_prompt(trans_data['商品描述_TW'], char_limit_all), api_key, selected_model)
+                                trans_data['規格_結構化_AI'] = get_gemini_response(create_spec_prompt(trans_data['規格_TW']), api_key, selected_model)
+                            else:
+                                trans_data['精簡描述_AI'] = ""
+                                trans_data['規格_結構化_AI'] = ""
+
+                            results_final.append(trans_data)
+                            prog_bar.progress((i+1)/len(models))
+                            time.sleep(1) # 避免 API 過熱
+                        
+                        status.update(label="✅ 全自動流程執行完畢！", state="complete", expanded=False)
+
+                    # 輸出
+                    df_final = pd.DataFrame(results_final)
+                    st.success(f"完成！共產出 {len(df_final)} 筆資料。")
+                    
+                    out = io.BytesIO()
+                    with pd.ExcelWriter(out, engine='openpyxl') as writer:
+                        df_final.to_excel(writer, index=False)
+                    st.download_button("📥 下載最終完整報表", out.getvalue(), "montbell_full_auto.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+
+            except Exception as e:
+                st.error(f"執行錯誤: {e}")
 
 # ==========================================
-# TAB 2: 翻譯 (Translator)
+# TAB 2: 爬蟲 (Scraper) - 保留原功能
 # ==========================================
-with tab2:
-    st.header("AI 智能翻譯 (日 -> 繁中)")
-    st.caption("透過 Gemini AI，將日文資料轉換為符合台灣戶外市場用語的在地化內容。")
+with tabs[1]:
+    st.header("📥 步驟一：官網爬蟲 (僅下載)")
+    uploaded_file = st.file_uploader("上傳 Excel", type=["xlsx", "xls"], key="up_1")
+    col1, col2 = st.columns(2)
+    with col1:
+        sheet_name = st.text_input("工作表", value="工作表1", key="sn_1")
+        model_col_idx = st.number_input("型號欄位索引", value=0, key="mi_1")
+        start_row = st.number_input("開始列", value=2, key="sr_1")
     
-    if not api_key:
-        st.error("⚠️ 請先在左側邊欄輸入 API Key 才能使用此功能。")
-    else:
-        uploaded_file_trans = st.file_uploader("上傳檔案 (通常是步驟一的結果)", type=["xlsx", "xls"], key="uploader_2")
+    if st.button("開始爬取", key="btn_1") and uploaded_file:
+        # 簡化的調用邏輯，為節省篇幅，此處邏輯與 Tab 1 類似，但只做爬蟲
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+        models = []
+        for idx, row in df.iterrows():
+            if idx >= start_row - 1:
+                if model_col_idx < len(row):
+                    m = str(row.iloc[model_col_idx]).strip()
+                    if re.match(r'^\d{7}$', m): models.append(m)
         
-        if uploaded_file_trans:
-            df_trans = pd.read_excel(uploaded_file_trans)
-            
-            col_config, col_action = st.columns([1, 2])
-            
-            with col_config:
-                st.markdown("#### 1. 欄位選擇")
-                cols_to_translate = st.multiselect(
-                    "選擇需要翻譯的欄位", 
-                    df_trans.columns,
-                    default=[c for c in df_trans.columns if c in ['商品名', '商品描述', '規格', '機能']]
-                )
-                st.info("💡 提示：AI 將會扮演「專業戶外譯者」的角色進行翻譯。")
-
-            with col_action:
-                st.markdown("#### 2. 預覽與執行")
-                st.dataframe(df_trans.head(3), use_container_width=True)
-                
-                if st.button("🌏 開始 AI 翻譯", type="primary", key="btn_trans"):
-                    if not cols_to_translate:
-                        st.warning("請至少選擇一個欄位。")
-                    else:
-                        new_df = df_trans.copy()
-                        total_steps = len(df_trans) * len(cols_to_translate)
-                        current_step = 0
-                        
-                        with st.status("正在進行 AI 翻譯...", expanded=True) as status:
-                            progress_bar = st.progress(0)
-                            
-                            for col in cols_to_translate:
-                                new_col_name = f"{col}_TW"
-                                new_df[new_col_name] = ""
-                                
-                                for idx, row in new_df.iterrows():
-                                    original_text = str(row[col])
-                                    if pd.notna(row[col]) and original_text.strip() != "":
-                                        status.update(label=f"翻譯中: [{col}] 第 {idx+1} 筆...")
-                                        
-                                        # 專業 Persona Prompt
-                                        prompt = f"""
-                                        角色設定：你是一位翻譯經驗豐富的專業譯者，對於戶外商品的機能名詞十分熟悉，同時對於社群行銷的用字也很了解，能夠將日文資料翻譯為符合台灣市場需求的內容。
-                                        任務：請將以下的日文商品資料翻譯成繁體中文 (台灣)。
-                                        翻譯原則：
-                                        1. 專有名詞請使用台灣戶外圈習慣的用語 (例如：透湿 -> 透氣)。
-                                        2. 語氣要通順自然，適合閱讀，避免生硬的直譯。
-                                        3. 嚴格禁止自我指涉，直接輸出翻譯內容。
-                                        原文：{original_text}
-                                        """
-                                        
-                                        trans_text = get_gemini_response(prompt, api_key)
-                                        new_df.at[idx, new_col_name] = trans_text
-                                        time.sleep(0.5)
-                                    
-                                    current_step += 1
-                                    progress_bar.progress(current_step / total_steps)
-                                    
-                            status.update(label="✅ 翻譯作業完成！", state="complete", expanded=False)
-                        
-                        st.success("翻譯成功！")
-                        output_trans = io.BytesIO()
-                        with pd.ExcelWriter(output_trans, engine='openpyxl') as writer:
-                            new_df.to_excel(writer, index=False)
-                            
-                        st.download_button(
-                            label="📥 下載翻譯結果 (Excel)",
-                            data=output_trans.getvalue(),
-                            file_name="montbell_data_translated.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
+        res = []
+        progress = st.progress(0)
+        for i, m in enumerate(models):
+            res.append(scrape_montbell_single(m))
+            progress.progress((i+1)/len(models))
+            time.sleep(0.5)
+        
+        df_res = pd.DataFrame(res)
+        st.success("爬取完成")
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine='openpyxl') as w: df_res.to_excel(w, index=False)
+        st.download_button("下載 Excel", out.getvalue(), "scraped.xlsx")
 
 # ==========================================
-# TAB 3: 優化 (Refiner)
+# TAB 3: 翻譯 (Translator) - 保留原功能
 # ==========================================
-with tab3:
-    st.header("資料精簡與結構化")
-    st.caption("將翻譯後的長篇大論，轉化為適合電商上架的精簡賣點與規格表。")
+with tabs[2]:
+    st.header("🈺 步驟二：AI 翻譯 (僅翻譯)")
+    up_trans = st.file_uploader("上傳 Excel", type=["xlsx", "xls"], key="up_2")
+    if up_trans and api_key:
+        df_t = pd.read_excel(up_trans)
+        cols = st.multiselect("選擇翻譯欄位", df_t.columns)
+        if st.button("開始翻譯", key="btn_2"):
+            new_df = df_t.copy()
+            prog = st.progress(0)
+            total = len(df_t) * len(cols)
+            curr = 0
+            for c in cols:
+                new_df[f"{c}_TW"] = ""
+                for i, r in new_df.iterrows():
+                    if pd.notna(r[c]):
+                        new_df.at[i, f"{c}_TW"] = get_gemini_response(create_trans_prompt(str(r[c])), api_key, selected_model)
+                    curr += 1
+                    prog.progress(curr/total)
+                    time.sleep(0.5)
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine='openpyxl') as w: new_df.to_excel(w, index=False)
+            st.download_button("下載翻譯檔", out.getvalue(), "translated.xlsx")
 
-    if not api_key:
-        st.error("⚠️ 請先在左側邊欄輸入 API Key。")
-    else:
-        uploaded_file_refine = st.file_uploader("上傳檔案 (通常是步驟二的結果)", type=["xlsx", "xls"], key="uploader_3")
+# ==========================================
+# TAB 4: 優化 (Refiner) - 更新 Slider
+# ==========================================
+with tabs[3]:
+    st.header("✨ 步驟三：優化精簡 (僅優化)")
+    up_ref = st.file_uploader("上傳 Excel", type=["xlsx", "xls"], key="up_3")
+    if up_ref and api_key:
+        df_r = pd.read_excel(up_ref)
+        c_desc = st.selectbox("描述欄位", df_r.columns)
+        c_spec = st.selectbox("規格欄位", ["(不處理)"] + list(df_r.columns))
+        # 更新：最低門檻改為 10
+        limit = st.slider("字數限制", 10, 200, 50)
         
-        if uploaded_file_refine:
-            df_refine = pd.read_excel(uploaded_file_refine)
+        if st.button("開始優化", key="btn_3"):
+            res_d, res_s = [], []
+            prog = st.progress(0)
+            for i, r in df_r.iterrows():
+                if pd.notna(r[c_desc]):
+                    res_d.append(get_gemini_response(create_refine_prompt(str(r[c_desc]), limit), api_key, selected_model))
+                else: res_d.append("")
+                
+                if c_spec != "(不處理)" and pd.notna(r[c_spec]):
+                    res_s.append(get_gemini_response(create_spec_prompt(str(r[c_spec])), api_key, selected_model))
+                else: res_s.append("")
+                prog.progress((i+1)/len(df_r))
+                time.sleep(0.5)
             
-            # 版面配置：左側設定，右側說明
-            c1, c2 = st.columns([1, 1])
+            df_r['精簡_AI'] = res_d
+            if c_spec != "(不處理)": df_r['規格_AI'] = res_s
             
-            with c1:
-                st.subheader("參數設定")
-                col_desc = st.selectbox("選擇【商品描述】來源欄位", df_refine.columns, index=len(df_refine.columns)-1 if '商品描述_TW' in df_refine.columns else 0)
-                col_spec = st.selectbox("選擇【規格】來源欄位 (選填)", ["(不處理)"] + list(df_refine.columns))
-                
-                st.markdown("---")
-                char_limit = st.slider("商品描述字數限制", min_value=30, max_value=200, value=50, step=10)
-                refine_specs_opt = st.toggle("啟用規格 AI 結構化 (整理為 Key-Value 格式)", value=True)
-                
-            with c2:
-                st.subheader("操作說明")
-                st.markdown("""
-                此步驟將執行以下優化：
-                * **描述精簡**：提取核心賣點，去除贅字，符合字數限制。
-                * **規格結構化**：將雜亂的規格文字整理成易讀的列表 (如啟用)。
-                """)
-                st.warning("注意：此步驟會消耗較多 Token，請耐心等待。")
-
-            st.markdown("---")
-            if st.button("✨ 開始資料優化", type="primary", key="btn_refine"):
-                with st.status("AI 正在施展魔法...", expanded=True) as status:
-                    progress = st.progress(0)
-                    results_desc = []
-                    results_spec = []
-                    total = len(df_refine)
-                    
-                    for idx, row in df_refine.iterrows():
-                        status.update(label=f"正在優化第 {idx+1}/{total} 筆...")
-                        progress.progress((idx+1)/total)
-                        
-                        # 1. 描述
-                        if pd.notna(row[col_desc]):
-                            p_desc = f"提取商品核心賣點並精簡至{char_limit}字內。原文：{str(row[col_desc])}"
-                            results_desc.append(get_gemini_response(p_desc, api_key))
-                        else:
-                            results_desc.append("")
-                            
-                        # 2. 規格
-                        if col_spec != "(不處理)" and refine_specs_opt and pd.notna(row[col_spec]):
-                            p_spec = f"優化產品規格表，保留【】標題，去除贅字，使用縮寫。原文：{str(row[col_spec])}"
-                            results_spec.append(get_gemini_response(p_spec, api_key))
-                        elif col_spec != "(不處理)":
-                            results_spec.append(row[col_spec])
-                        else:
-                            results_spec.append("")
-                            
-                        time.sleep(0.5)
-                    
-                    status.update(label="✨ 優化完成！", state="complete", expanded=False)
-
-                # 寫入與下載
-                df_refine['精簡描述_AI'] = results_desc
-                if col_spec != "(不處理)":
-                    df_refine['規格_結構化_AI'] = results_spec
-                
-                st.success("所有資料處理完畢！")
-                
-                # 顯示 Before / After 比較 (取第一筆範例)
-                with st.expander("👀 查看優化前後對比 (範例)", expanded=True):
-                    c_a, c_b = st.columns(2)
-                    with c_a:
-                        st.markdown("**處理前 (描述)**")
-                        st.text(str(df_refine.iloc[0][col_desc])[:100] + "...")
-                    with c_b:
-                        st.markdown(f"**處理後 (精簡 {char_limit} 字)**")
-                        st.success(results_desc[0])
-
-                output_final = io.BytesIO()
-                with pd.ExcelWriter(output_final, engine='openpyxl') as writer:
-                    df_refine.to_excel(writer, index=False)
-                    
-                st.download_button(
-                    label="📥 下載最終成品 (Excel)",
-                    data=output_final.getvalue(),
-                    file_name="montbell_final_optimized.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary"
-                )
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine='openpyxl') as w: df_r.to_excel(w, index=False)
+            st.download_button("下載優化檔", out.getvalue(), "refined.xlsx")
