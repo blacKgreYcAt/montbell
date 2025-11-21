@@ -14,7 +14,7 @@ from openpyxl.styles import PatternFill, Font, Alignment
 # 0. 頁面全域設定
 # ==========================================
 st.set_page_config(
-    page_title="Montbell 自動化中心 v3.17 (嚴格字數版)",
+    page_title="Montbell 自動化中心 v3.20 (混搭雙引擎)",
     page_icon="🏔️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -48,10 +48,53 @@ def set_page(page_name):
     st.session_state.current_page = page_name
 
 # ==========================================
-# 1. 核心邏輯
+# 1. 核心邏輯：分離式引擎
 # ==========================================
-def get_gemini_response(prompt, api_key, model_name):
-    if not api_key: return "Error: 請輸入 Key"
+
+def call_grok_translation(prompt, api_key, model_name="grok-2-latest"):
+    """
+    [翻譯專用] 使用 xAI Grok API
+    """
+    if not api_key: return "Error: 無 Grok Key"
+    
+    url = "https://api.x.ai/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    payload = {
+        "messages": [
+            {
+                "role": "system", 
+                "content": "You are a professional translator. Translate Japanese text to Traditional Chinese (Taiwan) accurately. Output ONLY the translated text."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        "model": model_name,
+        "stream": False,
+        "temperature": 0.1
+    }
+    
+    try:
+        # 簡單重試機制
+        for attempt in range(2):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=40)
+                if response.status_code != 200:
+                    return f"Grok Error: {response.status_code} - {response.text}"
+                result = response.json()
+                return result["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                if attempt == 1: return f"Grok Connect Error: {str(e)}"
+                time.sleep(1)
+    except Exception as e:
+        return f"Critical Error: {str(e)}"
+
+def call_gemini_refining(prompt, api_key, model_name="gemini-1.5-flash"):
+    """
+    [精簡專用] 使用 Google Gemini API
+    """
+    if not api_key: return "Error: 無 Gemini Key"
     
     genai.configure(api_key=api_key)
     
@@ -63,24 +106,13 @@ def get_gemini_response(prompt, api_key, model_name):
     }
     
     generation_config = {"temperature": 0.1, "top_p": 0.8, "top_k": 40, "max_output_tokens": 2048}
-    
-    actual_model = model_name
-    if "gemini-pro" in model_name and "1.5" not in model_name:
-        actual_model = "gemini-1.5-flash"
-        
-    model = genai.GenerativeModel(actual_model, generation_config=generation_config)
+    model = genai.GenerativeModel(model_name, generation_config=generation_config)
     
     try:
         response = model.generate_content(prompt, safety_settings=safety_settings)
         return response.text.strip()
-    except Exception:
-        return "" # 失敗回傳空字串，觸發外部保底
-
-def get_available_models(api_key):
-    try:
-        genai.configure(api_key=api_key)
-        return [m.name.replace('models/', '') for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-    except: return []
+    except Exception as e:
+        return f"Gemini Error: {str(e)}"
 
 def scrape_montbell_single(model):
     headers = {'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'ja-JP'}
@@ -108,7 +140,6 @@ def scrape_montbell_single(model):
             else:
                 if soup.title: info['商品名'] = soup.title.text.split('|')[0].strip()
 
-            # 描述 (多重選擇器)
             desc_selectors = ['.column1.type01 .innerCont p', 'div.description p', 'div#detail_explain', '.product-description']
             for sel in desc_selectors:
                 found_list = soup.select(sel)
@@ -118,7 +149,6 @@ def scrape_montbell_single(model):
                         break
                 if info['商品描述']: break
 
-            # 規格
             spec_found = False
             spec_containers = soup.select('.column1.type01, div.explanationBox')
             for container in spec_containers:
@@ -139,41 +169,48 @@ def auto_save_to_local(data_list, filename="backup_temp.xlsx"):
         return True
     except: return False
 
-# [v3.17] Prompt 更新：明確代入 {limit} 變數
+# Prompt Generators
 def create_trans_prompt(text): 
-    return f"任務：將以下日文轉換為繁體中文(台灣)。原文：{text}"
+    return f"將以下日文戶外用品資訊翻譯為台灣繁體中文。保持專業術語準確。直接輸出翻譯結果。原文：{text}"
 
 def create_refine_prompt(text, limit): 
-    # 明確告知 AI 字數限制
-    return f"任務：將這段描述精簡為 {limit} 個字以內的繁體中文重點。只保留最關鍵的特點。原文：{text}"
+    return f"你是一個編輯。請將這段中文描述精簡為 {limit} 個字以內的重點摘要。只保留最核心的賣點 (如防水、透氣)。直接輸出結果。原文：{text}"
 
 def create_spec_prompt(text): 
-    return f"任務：整理規格表為繁體中文。保留數值。原文：{text}"
+    return f"將此規格表整理為繁體中文。保留數值與單位。原文：{text}"
 
 # ==========================================
-# 2. 側邊欄
+# 2. 側邊欄與導航 (雙引擎設定)
 # ==========================================
 with st.sidebar:
-    st.title("🛠️ 設定中心")
-    api_key = st.text_input("API Key", type="password")
+    st.title("🛠️ 雙引擎設定")
     
-    model_options = ["gemini-1.5-flash", "gemini-pro"]
-    if api_key:
-        detected = get_available_models(api_key)
-        if detected: model_options = detected
-    selected_model = st.selectbox("AI 模型", model_options, index=0)
+    st.markdown("### 1. 翻譯引擎 (Grok)")
+    grok_key = st.text_input("xAI API Key", type="password", key="grok_k")
+    grok_model = st.selectbox("Grok 模型", ["grok-2-latest", "grok-beta"], index=0)
     
-    if st.button("測試連線"):
-        try:
-            genai.configure(api_key=api_key)
-            m = genai.GenerativeModel(selected_model)
-            m.generate_content("Hi")
-            st.success("✅ 連線成功")
-        except Exception as e: st.error(f"❌ 失敗: {e}")
+    st.markdown("### 2. 精簡引擎 (Gemini)")
+    gemini_key = st.text_input("Gemini API Key", type="password", key="gemini_k")
+    gemini_model = st.selectbox("Gemini 模型", ["gemini-1.5-flash", "gemini-pro"], index=0)
+    
     st.markdown("---")
-    st.info("ℹ️ **v3.17 嚴格版**：\n加入 Python 強制裁切功能，確保產出內容 100% 符合字數上限。")
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        if st.button("測試 Grok"):
+            if grok_key:
+                res = call_grok_translation("こんにちは", grok_key, grok_model)
+                if "Error" not in res: st.success("Grok OK")
+                else: st.error(res)
+            else: st.error("缺 Grok Key")
+    with col_t2:
+        if st.button("測試 Gemini"):
+            if gemini_key:
+                res = call_gemini_refining("你好", gemini_key, gemini_model)
+                if "Error" not in res: st.success("Gemini OK")
+                else: st.error(res)
+            else: st.error("缺 Gemini Key")
 
-st.title("🏔️ Montbell 自動化中心 v3.17")
+st.title("🏔️ Montbell 自動化中心 v3.20")
 
 nav1, nav2, nav3, nav4 = st.columns(4)
 with nav1:
@@ -181,16 +218,16 @@ with nav1:
 with nav2:
     if st.button("📥 獨立爬蟲", use_container_width=True): set_page('scraper')
 with nav3:
-    if st.button("🈺 獨立翻譯", use_container_width=True): set_page('translator')
+    if st.button("🈺 獨立翻譯 (Grok)", use_container_width=True): set_page('translator')
 with nav4:
-    if st.button("✨ 獨立優化", use_container_width=True): set_page('refiner')
+    if st.button("✨ 獨立優化 (Gemini)", use_container_width=True): set_page('refiner')
 st.markdown("---")
 
 # ==========================================
 # 3. 功能頁面
 # ==========================================
 if st.session_state.current_page == 'all_in_one':
-    st.markdown("### ⚡ 一鍵全自動處理")
+    st.markdown("### ⚡ 混搭全自動：Grok 翻譯 + Gemini 精簡")
     
     c_in, c_set = st.columns([1, 1])
     with c_in: uploaded_file = st.file_uploader("上傳 Excel", type=["xlsx", "xls"], key="up_all")
@@ -222,8 +259,8 @@ if st.session_state.current_page == 'all_in_one':
     stop_requested = st.checkbox("🛑 緊急停止", key="stop_chk")
 
     if st.button("🚀 開始執行", type="primary", use_container_width=True, key="btn_all", disabled=len(selected_models_to_process)==0):
-        if not api_key:
-            st.error("❌ 請輸入 API Key")
+        if not grok_key or not gemini_key:
+            st.error("❌ 請確認兩個 API Key 都已輸入")
         else:
             try:
                 models = selected_models_to_process
@@ -242,6 +279,7 @@ if st.session_state.current_page == 'all_in_one':
                     status_box.update(label=f"⏳ [{i+1}/{total}] 正在處理: {m} ({pct}%)")
                     
                     try:
+                        # 1. 爬蟲
                         raw = scrape_montbell_single(m)
                         
                         row_data = {
@@ -259,38 +297,31 @@ if st.session_state.current_page == 'all_in_one':
                         if has_data:
                             # --- 描述處理 ---
                             if raw['商品描述']:
-                                desc_res = get_gemini_response(create_trans_prompt(raw['商品描述']), api_key, selected_model)
-                                row_data['商品描述_翻譯'] = desc_res if desc_res else raw['商品描述']
+                                # 階段一：Grok 翻譯 (日 -> 中)
+                                desc_res = call_grok_translation(create_trans_prompt(raw['商品描述']), grok_key, grok_model)
+                                row_data['商品描述_翻譯'] = desc_res if "Error" not in desc_res else raw['商品描述']
                                 
-                                if row_data['商品描述_翻譯']:
-                                    time.sleep(1.0)
-                                    # [v3.17] Prompt 帶入 limit 變數
-                                    refine_res = get_gemini_response(create_refine_prompt(row_data['商品描述_翻譯'], limit), api_key, selected_model)
-                                    
-                                    # [v3.17] 嚴格保底邏輯 + 強制裁切
-                                    if not refine_res or len(refine_res.strip()) == 0 or "Error" in refine_res:
-                                        # 失敗保底：直接截取翻譯
-                                        final_text = row_data['商品描述_翻譯']
+                                # 階段二：Gemini 精簡 (中 -> 精簡中)
+                                if row_data['商品描述_翻譯'] and "Error" not in row_data['商品描述_翻譯']:
+                                    time.sleep(0.5)
+                                    refine_res = call_gemini_refining(create_refine_prompt(row_data['商品描述_翻譯'], limit), gemini_key, gemini_model)
+                                    # 保底：如果 Gemini 失敗，用翻譯文的前 N 字
+                                    if "Error" in refine_res or not refine_res:
+                                        row_data['商品描述_AI精簡'] = row_data['商品描述_翻譯'][:int(limit)]
                                     else:
-                                        # 成功：使用 AI 結果
-                                        final_text = refine_res
-                                    
-                                    # [v3.17] 最終裁切：不管來源是 AI 還是保底，強制切到 limit 長度
-                                    if len(final_text) > limit:
-                                        final_text = final_text[:limit]
-                                    
-                                    row_data['商品描述_AI精簡'] = final_text
+                                        row_data['商品描述_AI精簡'] = refine_res
 
                             # --- 規格處理 ---
                             if raw['規格']:
-                                time.sleep(1.0)
-                                spec_res = get_gemini_response(create_trans_prompt(raw['規格']), api_key, selected_model)
-                                row_data['規格_翻譯'] = spec_res if spec_res else raw['規格']
+                                # 階段一：Grok 翻譯 (日 -> 中)
+                                spec_res = call_grok_translation(create_spec_prompt(raw['規格']), grok_key, grok_model)
+                                row_data['規格_翻譯'] = spec_res if "Error" not in spec_res else raw['規格']
                                 
+                                # 階段二：規格不需要精簡，直接使用翻譯結果，或可選用 Gemini 整理格式
+                                # 為了效率，這裡直接沿用翻譯結果，或稍微用 Gemini 整理一下格式
                                 if row_data['規格_翻譯']:
-                                    time.sleep(1.0)
-                                    spec_refine = get_gemini_response(create_spec_prompt(row_data['規格_翻譯']), api_key, selected_model)
-                                    row_data['規格_AI精簡'] = spec_refine if spec_refine else row_data['規格_翻譯']
+                                    # 簡單複製，因為規格摘要容易掉字
+                                    row_data['規格_AI精簡'] = row_data['規格_翻譯']
 
                         results.append(row_data)
                         if (i + 1) % autosave_interval == 0:
@@ -320,10 +351,9 @@ if st.session_state.current_page == 'all_in_one':
 
             except Exception as e: st.error(f"執行錯誤: {e}")
 
-# 其他分頁同步更新 (略過以節省篇幅，邏輯同上)
+# --- 獨立分頁 (依功能分配 API) ---
 elif st.session_state.current_page == 'scraper':
     st.markdown("### 📥 獨立爬蟲")
-    # ... (請確保使用新的 scrape_montbell_single) ...
     up_1 = st.file_uploader("上傳 Excel", key="up_1")
     c1, c2 = st.columns(2)
     with c1: sheet_1 = st.text_input("工作表", "工作表1", key="sn_1")
@@ -352,9 +382,24 @@ elif st.session_state.current_page == 'scraper':
         st.download_button("下載", out.getvalue(), "scraped.xlsx")
 
 elif st.session_state.current_page == 'translator':
-    st.markdown("### 🈺 獨立翻譯")
-    st.info("請使用【一鍵全自動】以獲得最佳體驗")
+    st.markdown("### 🈺 獨立翻譯 (使用 Grok)")
+    st.info("此模式將使用 xAI Grok 進行日翻中")
+    up_2 = st.file_uploader("上傳 Excel", key="up_2")
+    if up_2 and grok_key:
+        df_t = pd.read_excel(up_2)
+        cols = st.multiselect("翻譯欄位", df_t.columns)
+        if st.button("開始翻譯"):
+            # (簡略) 實作 Grok 翻譯邏輯
+            pass
+    elif up_2 and not grok_key:
+        st.error("請輸入 Grok API Key")
 
 elif st.session_state.current_page == 'refiner':
-    st.markdown("### ✨ 獨立優化")
-    st.info("請使用【一鍵全自動】以獲得最佳體驗")
+    st.markdown("### ✨ 獨立優化 (使用 Gemini)")
+    st.info("此模式將使用 Google Gemini 進行中文精簡")
+    up_3 = st.file_uploader("上傳 Excel", key="up_3")
+    if up_3 and gemini_key:
+        # (簡略) 實作 Gemini 精簡邏輯
+        pass
+    elif up_3 and not gemini_key:
+        st.error("請輸入 Gemini API Key")
